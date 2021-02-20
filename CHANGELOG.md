@@ -1,6 +1,69 @@
 # Aparapi Changelog
 
-## 1.5.1
+## v2.0.1
+* Add support for getKernelMaxWorkGroupSize(), getKernelCompileWorkGroupSize(), getKernelPreferredWorkGroupSizeMultiple(), getKernelMinimumPrivateMemSizeInUsePerWorkItem() and getKernelLocalMemSizeInUse()
+* Fixed Barriers give inconsistent results on NVIDIA backend.
+* New Kernel.compile(...) methods for forcing pre-compilation of a kernel without executing it
+* Fixed NPE bug for Kernel.getProfileReportCurrentThread(device) and similar methods 
+* Fixed bug where ClassModel would throw an error when loaded if boot strap methods were 0.
+* Aparapi can now run on any OpenCL version rather than failing on untested versions it produces a warning.
+* Updated the following dependency versions:
+** com.aparapi: aparapi-jni 1.4.2 -> 1.4.3
+** org.apache.bcel:bcel 6.4.1 -< 6.5.0
+** org.scala-lang:scala-library 2.13.1 -> 2.13.4
+** com.syncleus:syncleus 7 -> 8 
+
+
+## v2.0.0
+
+* Fixed Potential JVM crash when using multi-dimensional arrays (> 1D)
+* Fixed bug causing wrong Aparapi-native library to be loaded.
+* Minimum Java JDK compatible is now 1.8 or higher, used to be 1.7
+* Updated the following dependency versions:
+** com.aparapi: aparapi-jni 1.4.1 -> 1.4.2
+** org.scala-lang: scala-library 2.12.6 -> 2.13.1
+** net.alchim31.maven: scala-maven-plugin 3.4.1 -> 4.3.0
+** org.apache.bcel: bcel 6.2 -> 6.4.1
+
+## 1.10.0
+
+* If statements with empty blocks and comparisons outside of if or while statements now compile and run on the GPU.
+* Fix kernel management inconsistencies regarding preferred devices management
+* Fix Java execution mode with barriers to not deadlock when a thread dies or is interrupted (InterruptedException)
+* Fix Java execution mode to fail-fast when Kernel execution fails
+* Java execution mode now provides detailed backtraces of failed Kernel threads including passId, groupIds, globalIds and localIds
+* Internal translation of bytecode is now facilitated by the BCEL library
+* Scala support has been added (see unit tests).
+* Fix arrays of AtomicInteger stored on local variables no longer fail with type cast exception while generating OpenCL (support for I_ALOAD_0,1,2,3 bytecode instructions)
+
+## 1.9.0
+
+* Fixed local arrays handling 1D and ND, to cope with arrays resizing across kernel executions
+* Significant speed-up on discrete GPUs with dedicated memory - OpenCLDevice.setSharedMemory(false)
+* Now supports efficient execution on discrete GPU and other devices with dedicated memory
+* Support for OpenCLDevice configurator/configure API
+
+## 1.8.0
+
+* Updated KernelManager to facilitate class extensions having constructors with non static parameters
+* Enable kernel profiling and execution simultaneously on multiple devices (multiple threads calling same kernel class on multiple devices)
+* Fixed JVM crash when multi-dimensional arrays were used in Local memory (2D and 3D local arrays are now supported)
+* Fixed bug where signed integer constants were being interpreted as unsigned values during Codegen.
+
+## 1.7.0
+
+* Fully support barrier() - localBarrier(),  globalBarrier() and localGlobalBarrier() on OpenCL 1.2 and later.
+* Improved exception handling, stack traces no longer double print and Error and other throwables are never caught.
+* Fix issue causing SEVERE log messages on Aparapi kernel profiling under multithreading.
+* Provide new interfaces for thread safe kernel profiling (mutiple threads calling same kernel class on same device).
+* Fixed occasional deadlock in JTP execution mode.
+* Significant speedup when running in JTP execution mode.
+
+## 1.6.0
+
+* Added support for Local arguments in kernel functions
+* Added full support for atomic operations of arrays of integers on OpenCL 1.2 and later.
+* Parent pom no longer points to a snapshot.
 
 ## 1.5.0
 

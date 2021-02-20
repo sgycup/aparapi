@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import com.aparapi.Range;
 import org.junit.Assert;
 import org.junit.Test;
 
-public class Issue69Test {
+public class MultiplePassesMemoryConsumptionTest {
 
     @Test
     public void test() {
@@ -31,22 +31,31 @@ public class Issue69Test {
                 globalArray[getGlobalId()] = getGlobalId();
             }
         };
+        System.gc();
+        long baseFree = Runtime.getRuntime().freeMemory();
         for (int loop = 0; loop < 100; loop++) {
-
-            System.out.printf("%3d free = %10d\n", loop, Runtime.getRuntime().freeMemory());
+            System.gc();
+            if( baseFree > Runtime.getRuntime().freeMemory())
+                baseFree = Runtime.getRuntime().freeMemory();
             kernel.execute(Range.create(512, 64), 1);
             for (int i = 0; i < globalArray.length; ++i) {
                 Assert.assertEquals("Wrong", i, globalArray[i]);
             }
         }
-        for (int loop = 0; loop < 100; loop++) {
 
-            System.out.printf("%3d free = %10d\n", loop, Runtime.getRuntime().freeMemory());
+        System.gc();
+        long testFree = Runtime.getRuntime().freeMemory();
+        for (int loop = 0; loop < 100; loop++) {
+            System.gc();
+            if( testFree > Runtime.getRuntime().freeMemory())
+                testFree = Runtime.getRuntime().freeMemory();
             kernel.execute(Range.create(512, 64), 2);
             for (int i = 0; i < globalArray.length; ++i) {
                 Assert.assertEquals("Wrong", i, globalArray[i]);
             }
         }
+        long extraMemory = baseFree - testFree;
+        Assert.assertTrue("Too much memory consumed: " + extraMemory, extraMemory < 4000000);
     }
 
 }

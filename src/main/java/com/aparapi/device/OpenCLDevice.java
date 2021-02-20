@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
  */
 package com.aparapi.device;
 
-import com.aparapi.opencl.OpenCL.Kernel;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -29,7 +27,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
+import com.aparapi.Config;
 import com.aparapi.Range;
 import com.aparapi.internal.opencl.OpenCLArgDescriptor;
 import com.aparapi.internal.opencl.OpenCLKernel;
@@ -41,11 +43,15 @@ import com.aparapi.opencl.OpenCL.Constant;
 import com.aparapi.opencl.OpenCL.GlobalReadOnly;
 import com.aparapi.opencl.OpenCL.GlobalReadWrite;
 import com.aparapi.opencl.OpenCL.GlobalWriteOnly;
+import com.aparapi.opencl.OpenCL.Kernel;
 import com.aparapi.opencl.OpenCL.Local;
 import com.aparapi.opencl.OpenCL.Resource;
 import com.aparapi.opencl.OpenCL.Source;
 
-public class OpenCLDevice extends Device{
+public class OpenCLDevice extends Device implements Comparable<Device> {
+   private static Logger logger = Logger.getLogger(Config.getLoggerName()); 	
+	
+   private static IOpenCLDeviceConfigurator configurator = null;
 
    private final OpenCLPlatform platform;
 
@@ -58,11 +64,22 @@ public class OpenCLDevice extends Device{
    private long globalMemSize;
 
    private long maxMemAllocSize;
+   
+   private boolean sharedMemory = true;
 
    private String shortDescription = null;
 
    private String name = null;
 
+   private AtomicBoolean underConfiguration = new AtomicBoolean(false);
+   /**
+    * Statically assigns a new configurator for all OpenCL devices detected after the assignment. 
+    * @param _configurator the configurator instance
+    */
+   public static void setConfigurator(IOpenCLDeviceConfigurator _configurator) {
+	   configurator = _configurator;
+   }
+   
    /**
     * Minimal constructor
     *
@@ -112,7 +129,7 @@ public class OpenCLDevice extends Device{
       globalMemSize = _globalMemSize;
    }
 
-   void setMaxWorkItemSize(int _dim, int _value) {
+   public void setMaxWorkItemSize(int _dim, int _value) {
       maxWorkItemSize[_dim] = _value;
    }
 
@@ -124,10 +141,52 @@ public class OpenCLDevice extends Device{
     this.name = name;
   }
 
+  /**
+   * Called by the underlying Aparapi OpenCL platform, upon device
+   * detection.
+   */
+  public void configure() {
+	  if (configurator != null && !underConfiguration.get() &&
+			  underConfiguration.compareAndSet(false, true)) {
+		 try {
+			  configurator.configure(this);
+		 } finally {
+			 underConfiguration.set(false);
+		 }
+	  }
+  }
+  
   @Override
   public long getDeviceId() {
       return (deviceId);
    }
+  
+  /**
+   * Configure if device has the memory shared with the host memory.
+   * <br/>
+   * <b>Note1: </b>For discrete GPU devices having dedicated memory, 
+   * thus not shared with host, this should be set to false. This can result
+   * in significant kernel execution speed-ups for such HW configurations.
+   * Aparapi is unable to detect this property automatically for all devices, unless
+   * the client application provides a configurator ({@link #IOpenCLDeviceConfigurator}). 
+   * <br/> 
+   * <b>Note2: </b>By default devices are initialized has having shared memory - to maintain
+   * backwards compatibility - unless Aparapi can unequivocally identify the device.
+   * @param _sharedMemory <ul><li>true, if OpenCL device has the memory shared with the host memory</li>
+   *             <li>false, if OpenCL device is a discrete unit, having dedicated memory, thus not shared with host</li></ul>
+   */
+  public void setSharedMemory(boolean _sharedMemory) {
+	  sharedMemory = _sharedMemory;
+  }
+  
+  /**
+   * Retrieves the shared memory flag 
+   * @return <ul><li>true, if OpenCL device has the memory shared with the host memory</li>
+   *             <li>false, if OpenCL device is a discrete unit, having dedicated memory, thus not shared with host</li></ul>   
+   */
+  public boolean isSharedMemory() {
+	  return sharedMemory;
+  }
 
    @Override
    public String getShortDescription() {
@@ -152,7 +211,7 @@ public class OpenCLDevice extends Device{
          disposed = false;
       }
 
-      @Override public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      @Override public Object invoke(Object proxy, Method method, Object[] args) {
          if (disposed){
             throw new IllegalStateException("bound interface already disposed");
          }

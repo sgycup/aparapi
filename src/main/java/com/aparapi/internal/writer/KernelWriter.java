@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,8 +61,10 @@ import com.aparapi.internal.instruction.InstructionSet.*;
 import com.aparapi.internal.model.*;
 import com.aparapi.internal.model.ClassModel.AttributePool.*;
 import com.aparapi.internal.model.ClassModel.AttributePool.RuntimeAnnotationsEntry.*;
+import com.aparapi.internal.model.ClassModel.AttributePool.RuntimeParameterAnnotationsEntry.ParameterInfo;
 import com.aparapi.internal.model.ClassModel.*;
 import com.aparapi.internal.model.ClassModel.ConstantPool.*;
+import com.aparapi.internal.model.ClassModel.ConstantPool.MethodReferenceEntry.Arg;
 
 import java.util.*;
 
@@ -158,6 +160,8 @@ public abstract class KernelWriter extends BlockWriter{
       javaToCLIdentifierMap.put("localBarrier()V", "barrier(CLK_LOCAL_MEM_FENCE)");
 
       javaToCLIdentifierMap.put("globalBarrier()V", "barrier(CLK_GLOBAL_MEM_FENCE)");
+      
+      javaToCLIdentifierMap.put("localGlobalBarrier()V", "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)");
    }
 
    /**
@@ -192,6 +196,9 @@ public abstract class KernelWriter extends BlockWriter{
          return isLocal ? (cvtLongArrayToLong) : (cvtLongArrayToLongStar);
       } else if (_typeDesc.equals("[S") || _typeDesc.equals("short[]")) {
          return isLocal ? (cvtShortArrayToShort) : (cvtShortArrayToShortStar);
+      } else if ("[Ljava/util/concurrent/atomic/AtomicInteger;".equals(_typeDesc) ||
+    		  "[Ljava.util.concurrent.atomic.AtomicInteger;".equals(_typeDesc)) {
+    	 return (cvtIntArrayToIntStar);
       }
       // if we get this far, we haven't matched anything yet
       if (useClassModel) {
@@ -290,6 +297,12 @@ public abstract class KernelWriter extends BlockWriter{
             if (((intrinsicMapping == null) && (_methodCall instanceof VirtualMethodCall) && (!isIntrinsic)) || (arg != 0)) {
                write(", ");
             }
+
+            Arg methodArg = _methodEntry.getArgs()[arg];
+            if (!methodArg.isArray() && "Ljava/util/concurrent/atomic/AtomicInteger;".equals(methodArg.getType())) {
+            	write("&");
+            }
+ 
             writeInstruction(_methodCall.getArg(arg));
          }
          write(")");
@@ -382,7 +395,10 @@ public abstract class KernelWriter extends BlockWriter{
 
          // If it is a converted array of objects, emit the struct param
          String className = null;
-         if (signature.startsWith("L")) {
+         if ("Ljava/util/concurrent/atomic/AtomicInteger;".equals(signature)) {
+            argLine.append("int");
+            thisStructLine.append("int");
+         } else if (signature.startsWith("L")) {
             // Turn Lcom/codegen/javalabs/opencl/demo/DummyOOA; into com_amd_javalabs_opencl_demo_DummyOOA for example
             className = (signature.substring(1, signature.length() - 1)).replace('/', '_');
             // if (logger.isLoggable(Level.FINE)) {
@@ -496,6 +512,12 @@ public abstract class KernelWriter extends BlockWriter{
       }
 
       if (usesAtomics) {
+         write("#define atomicGet(p) (*p)");
+         newLine();
+         
+         write("#define atomicSet(p, val) (*p=val)");
+         newLine();
+
          write("int atomicAdd(__global int *_arr, int _index, int _delta){");
          in();
          {
@@ -628,7 +650,10 @@ public abstract class KernelWriter extends BlockWriter{
 
          boolean alreadyHasFirstArg = !mm.getMethod().isStatic();
 
+         final RuntimeParameterAnnotationsEntry parameterAnnotations = 
+        		 	mm.getMethod().getAttributePool().getRuntimeVisibleParameterAnnotationsEntry();
          final LocalVariableTableEntry<LocalVariableInfo> lvte = mm.getLocalVariableTableEntry();
+         int localVariableIndex = 0;
          for (final LocalVariableInfo lvi : lvte) {
             if ((lvi.getStart() == 0) && ((lvi.getVariableIndex() != 0) || mm.getMethod().isStatic())) { // full scope but skip this
                final String descriptor = lvi.getVariableDescriptor();
@@ -636,13 +661,36 @@ public abstract class KernelWriter extends BlockWriter{
                   write(", ");
                }
 
-               if (descriptor.startsWith("[") && !lvi.getVariableName().endsWith(PRIVATE_SUFFIX)) {
-                  write(" __global ");
+               if (descriptor.startsWith("[")) {
+                  boolean isPrivate = false;
+                  boolean isLocal = false;
+                  if(lvi.getVariableName().endsWith(PRIVATE_SUFFIX)) {
+                     isPrivate = true;
+                  } else if (lvi.getVariableName().endsWith(Kernel.LOCAL_SUFFIX)) {
+                     isLocal = true;
+                  } else if (parameterAnnotations != null) {
+                     ParameterInfo paramInfo = parameterAnnotations.getPool().get(localVariableIndex);
+                     List<ParameterInfo.AnnotationInfo> paramAnnotations = paramInfo.getAnnotations();
+                     for (ParameterInfo.AnnotationInfo annotation : paramAnnotations) {
+                        if (annotation.getTypeDescriptor().equals(LOCAL_ANNOTATION_NAME)) {
+                            isLocal = true;
+                            break;
+                        }
+                     }
+                  }
+                  
+	           	   if (isLocal) {
+	        		   write(" __local "); 
+	        	   } else if (!isPrivate) {
+	        		   write(" __global ");
+	        	   }
                }
-
+               
                write(convertType(descriptor, true, false));
                write(lvi.getVariableName());
                alreadyHasFirstArg = true;
+               
+               localVariableIndex++;
             }
          }
          write(")");

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,30 @@
  */
 package com.aparapi.internal.kernel;
 
+import java.util.concurrent.atomic.AtomicReference;
+
 /**
  * Created by Barney on 02/09/2015.
  */
 public enum ProfilingEvent {
-   START, CLASS_MODEL_BUILT, INIT_JNI, OPENCL_GENERATED, OPENCL_COMPILED, PREPARE_EXECUTE, EXECUTED
+   START, CLASS_MODEL_BUILT, INIT_JNI, OPENCL_GENERATED, OPENCL_COMPILED, PREPARE_EXECUTE, EXECUTED;
+
+	
+   static final AtomicReference<String[]> stagesNames = new AtomicReference<String[]>(null);
+   public static String[] getStagesNames() {
+	  String[] result = null;
+	  result = stagesNames.get();
+	  if (result == null) {
+		  final String[] names = new String[values().length];
+		  for (int i = 0; i < values().length; i++) {
+			  names[i] = values()[i].name();
+		  }
+		  if (stagesNames.compareAndSet(null, names)) {
+			  result = names;
+		  } else {
+			  result = stagesNames.get();
+		  }
+	  }
+	  return result;
+   }
 }

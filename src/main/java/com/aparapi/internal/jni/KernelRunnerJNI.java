@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -339,6 +339,16 @@ public abstract class KernelRunnerJNI{
    protected native int disposeJNI(long _jniContextHandle);
 
    protected native String getExtensionsJNI(long _jniContextHandle);
-
+   
    protected native synchronized List<ProfileInfo> getProfileInfoJNI(long _jniContextHandle);
+   
+   protected native long getKernelMinimumPrivateMemSizeInUsePerWorkItemJNI(long _jniContextHandle);
+   
+   protected native long getKernelLocalMemSizeInUseJNI(long _jniContextHandle);
+   
+   protected native int getKernelPreferredWorkGroupSizeMultipleJNI(long _jniContextHandle);
+   
+   protected native int getKernelMaxWorkGroupSizeJNI(long _jniContextHandle);
+   
+   protected native int[] getKernelCompileWorkGroupSizeJNI(long _jniContextHandle);
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,4 +34,7 @@ public class OpenCLMem{
    public Object instance;
 
    public OpenCLProgram program;
+   
+   //Dummy JNI method just to ensure that above definition are generated for aparapi-native with newer Java > 8 compilers
+   private native void dummyJNI();
 }

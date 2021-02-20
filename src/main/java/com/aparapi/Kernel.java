@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ under those regulations, please refer to the U.S. Bureau of Industry and Securit
 package com.aparapi;
 
 import com.aparapi.annotation.Experimental;
-import com.aparapi.exception.DeprecatedException;
+import com.aparapi.exception.QueryFailedException;
 import com.aparapi.internal.model.CacheEnabler;
 import com.aparapi.internal.model.ClassModel.ConstantPool.MethodReferenceEntry;
 import com.aparapi.internal.model.ClassModel.ConstantPool.NameAndTypeEntry;
@@ -67,6 +67,7 @@ import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -79,12 +80,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinPool.ManagedBlocker;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.IntBinaryOperator;
 import java.util.logging.Logger;
 
 import com.aparapi.device.Device;
 import com.aparapi.device.JavaDevice;
 import com.aparapi.device.OpenCLDevice;
+import com.aparapi.exception.CompileFailedException;
+import com.aparapi.internal.kernel.IKernelBarrier;
 import com.aparapi.internal.kernel.KernelArg;
+import com.aparapi.internal.kernel.KernelDeviceProfile;
 import com.aparapi.internal.kernel.KernelManager;
 import com.aparapi.internal.kernel.KernelProfile;
 import com.aparapi.internal.kernel.KernelRunner;
@@ -373,17 +382,10 @@ public abstract class Kernel implements Cloneable {
     *     kernel.execute(values.length);
     * </pre></blockquote>
     * <p>
-<<<<<<< HEAD:src/main/java/com/codegen/Kernel.java
     * Alternatively, the property <code>com.codegen.executionMode</code> can be set to one of <code>JTP,GPU,ACC,CPU,SEQ</code>
     * when an application is launched. 
     * <p><blockquote><pre>
     *    java -classpath ....;codegen.jar -Dcom.codegen.executionMode=GPU MyApplication
-=======
-    * Alternatively, the property <code>com.amd.codegen.executionMode</code> can be set to one of <code>JTP,GPU,ACC,CPU,SEQ</code>
-    * when an application is launched.
-    * <p><blockquote><pre>
-    *    java -classpath ....;codegen.jar -Dcom.amd.codegen.executionMode=GPU MyApplication
->>>>>>> b118aad... added method to set execution mode without any fallback:com.amd.codegen/src/java/com/amd/codegen/Kernel.java
     * </pre></blockquote><p>
     * Generally setting the execution mode is not recommended (it is best to let Aparapi decide automatically) but the option
     * provides a way to compare a kernel's performance under multiple execution modes.
@@ -447,20 +449,16 @@ public abstract class Kernel implements Cloneable {
          final String executionMode = Config.executionMode;
 
          if (executionMode != null) {
-            try {
-               LinkedHashSet<EXECUTION_MODE> requestedExecutionModes;
-               requestedExecutionModes = EXECUTION_MODE.getExecutionModeFromString(executionMode);
-               logger.fine("requested execution mode =");
-               for (final EXECUTION_MODE mode : requestedExecutionModes) {
-                  logger.fine(" " + mode);
-               }
-               if ((OpenCLLoader.isOpenCLAvailable() && EXECUTION_MODE.anyOpenCL(requestedExecutionModes))
-                     || !EXECUTION_MODE.anyOpenCL(requestedExecutionModes)) {
-                  defaultExecutionModes = requestedExecutionModes;
-               }
-            } catch (final Throwable t) {
-               // we will take the default
-            }
+           LinkedHashSet<EXECUTION_MODE> requestedExecutionModes;
+           requestedExecutionModes = EXECUTION_MODE.getExecutionModeFromString(executionMode);
+           logger.fine("requested execution mode =");
+           for (final EXECUTION_MODE mode : requestedExecutionModes) {
+              logger.fine(" " + mode);
+           }
+           if ((OpenCLLoader.isOpenCLAvailable() && EXECUTION_MODE.anyOpenCL(requestedExecutionModes))
+                 || !EXECUTION_MODE.anyOpenCL(requestedExecutionModes)) {
+              defaultExecutionModes = requestedExecutionModes;
+           }
          }
 
          logger.info("default execution modes = " + defaultExecutionModes);
@@ -522,9 +520,7 @@ public abstract class Kernel implements Cloneable {
 
       private int passId;
 
-      private volatile CyclicBarrier localBarrier;
-
-      private boolean localBarrierDisabled;
+      private final AtomicReference<IKernelBarrier> localBarrier = new AtomicReference<IKernelBarrier>();
 
       /**
        * Default constructor
@@ -542,7 +538,7 @@ public abstract class Kernel implements Cloneable {
          groupIds = kernelState.getGroupIds();
          range = kernelState.getRange();
          passId = kernelState.getPassId();
-         localBarrier = kernelState.getLocalBarrier();
+         localBarrier.set(kernelState.getLocalBarrier());
       }
 
       /**
@@ -648,34 +644,72 @@ public abstract class Kernel implements Cloneable {
       /**
        * @return the localBarrier
        */
-      public CyclicBarrier getLocalBarrier() {
-         return localBarrier;
+      public IKernelBarrier getLocalBarrier() {
+         return localBarrier.get();
       }
 
       /**
        * @param localBarrier the localBarrier to set
        */
-      public void setLocalBarrier(CyclicBarrier localBarrier) {
-         this.localBarrier = localBarrier;
+      public void setLocalBarrier(IKernelBarrier localBarrier) {
+         this.localBarrier.set(localBarrier);
       }
 
       public void awaitOnLocalBarrier() {
-         if (!localBarrierDisabled) {
-            try {
-               kernelState.getLocalBarrier().await();
-            } catch (final InterruptedException e) {
-               // TODO Auto-generated catch block
-               e.printStackTrace();
-            } catch (final BrokenBarrierException e) {
-               // TODO Auto-generated catch block
-               e.printStackTrace();
-            }
-         }
+    	  boolean completed = false;
+    	  final IKernelBarrier barrier = localBarrier.get();
+    	  while (!completed && barrier != null) {
+    		  try {
+    			  ForkJoinPool.managedBlock(barrier); //ManagedBlocker already has to be reentrant
+    			  completed = true;
+    		  } catch (InterruptedException ex) {
+    			  //Empty on purpose, either barrier is disabled on InterruptedException or lock will have to complete
+    		  }
+    	  }
       }
 
       public void disableLocalBarrier() {
-         localBarrierDisabled = true;
+    	  final IKernelBarrier barrier = localBarrier.getAndSet(null);
+    	  if (barrier != null) {
+    		  barrier.cancelBarrier();
+    	  }
       }
+
+  	  public String describe() {
+  	      final StringBuilder sb = new StringBuilder(100);
+  	      sb.append("Pass Id: ");
+  	      sb.append(passId);
+  	      sb.append(" - Group IDs: [");
+  	      boolean first = true;
+          for (int groupId : groupIds) {
+              if (!first) {
+                  sb.append(", ");
+              }
+              sb.append(groupId);
+              first = false;
+          }
+  	      sb.append("] - Global IDs: [");
+  	      first = true;
+  	      for (int globalId : globalIds) {
+  	          if (!first) {
+  	              sb.append(", ");
+  	          }
+  	          sb.append(globalId);
+  	          first = false;
+  	      }
+  	      sb.append("], Local IDs: [");
+  	      first = true;
+          for (int localId : localIds) {
+              if (!first) {
+                  sb.append(", ");
+              }
+              sb.append(localId);
+              first = false;
+          }
+          sb.append("]");
+          
+          return sb.toString();
+  	  }
    }
 
    /**
@@ -2314,8 +2348,122 @@ public abstract class Kernel implements Cloneable {
       }
    }
 
+   @OpenCLMapping(atomic32 = true)
+   protected final int atomicGet(AtomicInteger p) {
+	   return p.get();
+   }
+   
+   @OpenCLMapping(atomic32 = true)
+   protected final void atomicSet(AtomicInteger p, int val) {
+	   p.set(val);
+   }
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_add")
+   protected final int atomicAdd(AtomicInteger p, int val) {
+	   return p.getAndAdd(val);
+   }
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_sub")
+   protected final int atomicSub(AtomicInteger p, int val) {
+	   return p.getAndAdd(-val);
+   }
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_xchg")
+   protected final int atomicXchg(AtomicInteger p, int newVal) {
+	   return p.getAndSet(newVal);
+   }
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_inc")
+   protected final int atomicInc(AtomicInteger p) {
+	   return p.getAndIncrement();
+   }
+   
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_dec")
+   protected final int atomicDec(AtomicInteger p) {
+	   return p.getAndDecrement();
+   }
+   
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_cmpxchg")
+   protected final int atomicCmpXchg(AtomicInteger p, int expectedVal, int newVal) {
+	   if (p.compareAndSet(expectedVal, newVal)) {
+		   return expectedVal;
+	   } else {
+		   return p.get();
+	   }
+   }
+ 
+   private static final IntBinaryOperator minOperator = new IntBinaryOperator() {
+	  @Override
+	  public int applyAsInt(int oldVal, int newVal) {
+	  	 return Math.min(oldVal, newVal);
+	  }
+   };
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_min")
+   protected final int atomicMin(AtomicInteger p, int val) {
+	   return p.getAndAccumulate(val, minOperator);
+   }
+
+   private static final IntBinaryOperator maxOperator = new IntBinaryOperator() {
+	  @Override
+	  public int applyAsInt(int oldVal, int newVal) {
+		 return Math.max(oldVal, newVal);
+	  }	   
+   };
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_max")
+   protected final int atomicMax(AtomicInteger p, int val) {
+	   return p.getAndAccumulate(val, maxOperator);
+   }
+
+   private static final IntBinaryOperator andOperator = new IntBinaryOperator() {
+	  @Override
+	  public int applyAsInt(int oldVal, int newVal) {
+		 return oldVal & newVal;
+	  }	   
+   };
+
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_and")
+   protected final int atomicAnd(AtomicInteger p, int val) {
+	   return p.getAndAccumulate(val, andOperator);
+   }
+
+   private static final IntBinaryOperator orOperator = new IntBinaryOperator() {
+	  @Override
+	  public int applyAsInt(int oldVal, int newVal) {
+		 return oldVal | newVal;
+	  }	   
+   };
+   
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_or")
+   protected final int atomicOr(AtomicInteger p, int val) {
+	   return p.getAndAccumulate(val, orOperator);
+   }
+
+   private static final IntBinaryOperator xorOperator = new IntBinaryOperator() {
+	  @Override
+	  public int applyAsInt(int oldVal, int newVal) {
+		 return oldVal ^ newVal;
+	  }	   
+   };
+   
+   @OpenCLMapping(atomic32 = true, mapTo = "atomic_xor")
+   protected final int atomicXor(AtomicInteger p, int val) {
+	   return p.getAndAccumulate(val, xorOperator);
+   }
+
    /**
-    * Wait for all kernels in the current group to rendezvous at this call before continuing execution.
+    * Wait for all kernels in the current work group to rendezvous at this call before continuing execution.<br> 
+    * It will also enforce memory ordering, such that modifications made by each thread in the work-group, to the memory,
+    * before entering into this barrier call will be visible by all threads leaving the barrier.
+    * <br>
+    * <br><b>Note1: </b>In OpenCL will execute as barrier(CLK_LOCAL_MEM_FENCE), which will have a different behaviour than in Java,
+    * because it will only guarantee visibility of modifications made to <b>local memory space</b> to all threads leaving the barrier.
+    * <br>
+    * <br><b>Note2: </b>In OpenCL it is required that all threads must enter the same if blocks and must iterate
+    * the same number of times in all loops (for, while, ...).
+    * <br>
+    * <br><b>Note3: </b> Java version is identical to localBarrier(), globalBarrier() and localGlobalBarrier()
     *
     * @annotion Experimental
     */
@@ -2326,20 +2474,50 @@ public abstract class Kernel implements Cloneable {
    }
 
    /**
-    * Wait for all kernels in the current group to rendezvous at this call before continuing execution.
-    *
-    *
-    * Java version is identical to localBarrier()
+    * Wait for all kernels in the current work group to rendezvous at this call before continuing execution.<br> 
+    * It will also enforce memory ordering, such that modifications made by each thread in the work-group, to the memory,
+    * before entering into this barrier call will be visible by all threads leaving the barrier.
+    * <br> 
+    * <br><b>Note1: </b>In OpenCL will execute as barrier(CLK_GLOBAL_MEM_FENCE), which will have a different behaviour; than in Java,
+    * because it will only guarantee visibility of modifications made to <b>global memory space</b> to all threads,
+    * in the work group, leaving the barrier.
+    * <br>
+    * <br><b>Note2: </b>In OpenCL it is required that all threads must enter the same if blocks and must iterate
+    * the same number of times in all loops (for, while, ...).
+    * <br>
+    * <br><b>Note3: </b> Java version is identical to localBarrier(), globalBarrier() and localGlobalBarrier()
     *
     * @annotion Experimental
-    * @deprecated
     */
    @OpenCLDelegate
    @Experimental
-   @Deprecated
-   protected final void globalBarrier() throws DeprecatedException {
-      throw new DeprecatedException(
-            "Kernel.globalBarrier() has been deprecated. It was based an incorrect understanding of OpenCL functionality.");
+   protected final void globalBarrier() {
+	   kernelState.awaitOnLocalBarrier();
+   }
+
+   /**
+    * Wait for all kernels in the current work group to rendezvous at this call before continuing execution.<br> 
+    * It will also enforce memory ordering, such that modifications made by each thread in the work-group, to the memory,
+    * before entering into this barrier call will be visible by all threads leaving the barrier.
+    * <br> 
+    * <br><b>Note1: </b>When in doubt, use this barrier instead of localBarrier() or globalBarrier(), despite the possible
+    * performance loss.
+    * <br>
+    * <br><b>Note2: </b>In OpenCL will execute as barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE), which will 
+    * have the same behaviour than in Java, because it will guarantee the visibility of modifications made to 
+    * <b>any of the memory spaces</b> to all threads, in the work group, leaving the barrier.
+    * <br>
+    * <br><b>Note3: </b>In OpenCL it is required that all threads must enter the same if blocks and must iterate
+    * the same number of times in all loops (for, while, ...).
+    * <br>
+    * <br><b>Note4: </b> Java version is identical to localBarrier(), globalBarrier() and localGlobalBarrier()
+    *
+    * @annotion Experimental
+    */
+   @OpenCLDelegate
+   @Experimental
+   protected final void localGlobalBarrier() {
+	   kernelState.awaitOnLocalBarrier();
    }
 
    @OpenCLMapping(mapTo = "hypot")
@@ -2364,11 +2542,124 @@ public abstract class Kernel implements Cloneable {
    }
 
    /**
-    * Determine the execution time of the previous Kernel.execute(range) call.
+    * Registers a new profile report observer to receive profile reports as they're produced.
+    * This is the method recommended when the client application desires to receive all the execution profiles
+    * for the current kernel instance on all devices over all client threads running such kernel with a single observer<br>
+    * <b>Note1: </b>A report will be generated by a thread that finishes executing a kernel. In multithreaded execution
+    * environments it is up to the observer implementation to handle thread safety.
+	* <br>
+	* <b>Note2: </b>To cancel the report subscription just set observer to <code>null</code> value.
+    * <br>
+    * @param observer the observer instance that will receive the profile reports
+    */
+   public void registerProfileReportObserver(IProfileReportObserver observer) {
+      KernelProfile profile = KernelManager.instance().getProfile(getClass());
+      synchronized (profile) {
+    	  profile.setReportObserver(observer);
+      }	   
+   }
+
+   /**
+    * Retrieves a profile report for the last thread that executed this kernel on the given device.
+    * A report will only be available if at least one thread executed the kernel on the device.
+    * <br>
+    * <b>Note1: </b>If the profile report is intended to be kept in memory, the object should be cloned with
+    * {@link com.aparapi.ProfileReport#clone()}<br>
     *
-    * Note that for the first call this will include the conversion time.
+    * @param device the relevant device where the kernel executed 
     *
-    * @return The time spent executing the kernel (ms)
+    * @return <ul><li>the profiling report for the current most recent execution</li>
+    *             <li>null, if no profiling report is available for such thread</li></ul>
+    *
+    * @see #getProfileReportCurrentThread(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
+    * @see #getAccumulatedExecutionTimeAllThreads(Device)
+    * 
+    * @see #getExecutionTimeLastThread()
+    * @see #getConversionTimeLastThread()
+    */
+   public WeakReference<ProfileReport> getProfileReportLastThread(Device device) {
+	   KernelProfile profile = KernelManager.instance().getProfile(getClass());
+	   KernelDeviceProfile deviceProfile = null;
+	   boolean hasObserver = false;
+	   synchronized (profile) {
+		   if (profile.getReportObserver() != null) {
+			   hasObserver = true;
+		   }
+		   deviceProfile = profile.getDeviceProfile(device);
+	   }
+
+	   if (deviceProfile == null) {
+		   return null;
+	   }
+	   
+	   if (hasObserver) {
+		   return null;
+	   }
+	   
+	   return deviceProfile.getReportLastThread();
+   }
+   
+   /**
+    * Retrieves the most recent complete report available for the current thread calling this method for
+    * the current kernel instance and executed on the given device.
+    * <br>
+    * <b>Note1: </b>If the profile report is intended to be kept in memory, the object should be cloned with
+    * {@link com.aparapi.ProfileReport#clone()}<br>
+    * <b>Note2: </b>If the thread didn't execute this kernel on the specified device, it
+    * will return null.
+    *    
+    * @param device the relevant device where the kernel executed 
+    * 
+    * @return <ul><li>the profiling report for the current most recent execution</li>
+    *             <li>null, if no profiling report is available for such thread</li></ul>
+    *
+    * @see #getProfileReportLastThread(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
+    * @see #getExecutionTimeCurrentThread(Device)
+    * @see #getConversionTimeCurrentThread(Device)
+    * @see #getAccumulatedExecutionTimeAllThreads(Device)
+    */
+   public WeakReference<ProfileReport> getProfileReportCurrentThread(Device device) {
+	   KernelProfile profile = KernelManager.instance().getProfile(getClass());
+	   KernelDeviceProfile deviceProfile = null;
+	   boolean hasObserver = false;
+	   synchronized (profile) {
+		   if (profile.getReportObserver() != null) {
+			   hasObserver = true;
+		   }
+		   deviceProfile = profile.getDeviceProfile(device);
+	   }
+
+	   if (deviceProfile == null) {
+		   return null;
+	   }
+	   
+	   if (hasObserver) {
+		   return null;
+	   }
+	   
+	   return deviceProfile.getReportCurrentThread();
+   }   
+   
+   /**
+    * Determine the execution time of the previous Kernel.execute(range) called from the last thread that ran and 
+    * executed on the most recently used device.
+    * <br>
+    * <b>Note1: </b>This is kept for backwards compatibility only, usage of either
+    * {@link #getProfileReportLastThread(Device)} or {@link #registerProfileReportObserver(IProfileReportObserver)}
+    * is encouraged instead.<br>
+    * <b>Note2: </b>Calling this method is not recommended when using more than a single thread to execute
+    * the same kernel, or when running kernels on more than one device concurrently.<br>
+    * <br>
+    * Note that for the first call this will include the conversion time.<br>
+    * <br>
+    * @return <ul><li>The time spent executing the kernel (ms)</li>
+    *             <li>NaN, if no profile report is available</li></ul>
+    *
+    * @see #getProfileReportCurrentThread(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
+    * @see #getAccumulatedExecutionTimeAllThreads(Device)
     *
     * @see #getConversionTime();
     * @see #getAccumulatedExecutionTime();
@@ -2382,11 +2673,111 @@ public abstract class Kernel implements Cloneable {
    }
 
    /**
-    * Determine the total execution time of all previous Kernel.execute(range) calls.
+    * Determine the time taken to convert bytecode to OpenCL for first Kernel.execute(range) call.
+    * <br>
+    * <b>Note1: </b>This is kept for backwards compatibility only, usage of either
+    * {@link #getProfileReportLastThread(Device)} or {@link #registerProfileReportObserver(IProfileReportObserver)}
+    * is encouraged instead.<br>
+    * <b>Note2: </b>Calling this method is not recommended when using more than a single thread to execute
+    * the same kernel, or when running kernels on more than one device concurrently.<br>
+    * <br>
+    * Note that for the first call this will include the conversion time.<br>
+    * <br>
+    * @return <ul><li>The time spent preparing the kernel for execution using GPU</li>
+    *             <li>NaN, if no profile report is available</li></ul>
     *
+    *
+    * @see #getProfileReportCurrentThread(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
+    * @see #getAccumulatedExecutionTimeAllThreads(Device)
+    *    
+    * @see #getAccumulatedExecutionTime();
+    * @see #getExecutionTime();
+    */
+   public double getConversionTime() {
+      KernelProfile profile = KernelManager.instance().getProfile(getClass());
+      synchronized (profile) {
+         return profile.getLastConversionTime();
+      }
+   }
+
+   /**
+    * Determine the total execution time of all previous kernel executions called from the current thread,
+    * calling this method, that executed the current kernel on the specified device.
+    * <br>
+    * <b>Note1: </b>This is the recommended method to retrieve the accumulated execution time for a single
+    * current thread, even when doing multithreading for the same kernel and device.
+    * <br>
     * Note that this will include the initial conversion time.
     *
-    * @return The total time spent executing the kernel (ms)
+    * @param the device of interest where the kernel executed
+    *
+    * @return <ul><li>The total time spent executing the kernel (ms)</li>
+    *             <li>NaN, if no profiling information is available</li></ul>
+    *
+    * @see #getProfileReportCurrentThread(Device)
+    * @see #getProfileReportLastThread(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
+    * @see #getAccumulatedExecutionTimeAllThreads(Device)
+    */
+	public double getAccumulatedExecutionTimeCurrentThread(Device device) {
+      KernelProfile profile = KernelManager.instance().getProfile(getClass());
+      synchronized (profile) {
+    	  KernelDeviceProfile deviceProfile = profile.getDeviceProfile(device);
+    	  if (deviceProfile == null) {
+    		  return Double.NaN;
+    	  }
+    	  return deviceProfile.getCumulativeElapsedTimeAllCurrentThread() / KernelProfile.MILLION;
+      }		
+	}
+   
+   /**
+    * Determine the total execution time of all produced profile reports from all threads that executed the
+    * current kernel on the specified device.
+    * <br>
+    * <b>Note1: </b>This is the recommended method to retrieve the accumulated execution time, even
+    * when doing multithreading for the same kernel and device.
+    * <br>
+    * Note that this will include the initial conversion time.
+    *
+    * @param the device of interest where the kernel executed
+    *
+    * @return <ul><li>The total time spent executing the kernel (ms)</li>
+    *             <li>NaN, if no profiling information is available</li></ul>
+    *
+    * @see #getProfileReportCurrentThread(Device)
+    * @see #getProfileReportLastThread(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
+    * @see Kernel#getAccumulatedExecutionTimeCurrentThread(Device)
+    */
+   public double getAccumulatedExecutionTimeAllThreads(Device device) {
+      KernelProfile profile = KernelManager.instance().getProfile(getClass());
+      synchronized (profile) {
+    	  KernelDeviceProfile deviceProfile = profile.getDeviceProfile(device);
+    	  if (deviceProfile == null) {
+    		  return Double.NaN;
+    	  }
+    	  return deviceProfile.getCumulativeElapsedTimeAllGlobal() / KernelProfile.MILLION;
+      }
+   }
+   
+   /**
+    * Determine the total execution time of all previous Kernel.execute(range) calls for all threads
+    * that ran this kernel for the device used in the last kernel execution.   
+    * <br>
+    * <b>Note1: </b>This is kept for backwards compatibility only, usage of 
+    * {@link #getAccumulatedExecutionTimeAllThreads(Device)} is encouraged instead.<br>
+    * <b>Note2: </b>Calling this method is not recommended when using more than a single thread to execute
+    * the same kernel on multiple devices concurrently.<br>
+    * <br>
+    * Note that this will include the initial conversion time.
+    *
+    * @return <ul><li>The total time spent executing the kernel (ms)</li>
+    *             <li>NaN, if no profiling information is available</li></ul>
+    * 
+    * @see #getAccumulatedExecutionTime(Device));
+    * @see #getProfileReport(Device)
+    * @see #registerProfileReportObserver(IProfileReportObserver)
     *
     * @see #getExecutionTime();
     * @see #getConversionTime();
@@ -2398,21 +2789,7 @@ public abstract class Kernel implements Cloneable {
          return profile.getAccumulatedTotalTime();
       }
    }
-
-   /**
-    * Determine the time taken to convert bytecode to OpenCL for first Kernel.execute(range) call.
-    * @return The time spent preparing the kernel for execution using GPU
-    *
-    * @see #getExecutionTime();
-    * @see #getAccumulatedExecutionTime();
-    */
-   public double getConversionTime() {
-      KernelProfile profile = KernelManager.instance().getProfile(getClass());
-      synchronized (profile) {
-         return profile.getLastConversionTime();
-      }
-   }
-
+      
    /**
     * Start execution of <code>_range</code> kernels.
     * <p>
@@ -2530,6 +2907,85 @@ public abstract class Kernel implements Cloneable {
       return prepareKernelRunner().execute(_entrypoint, _range, _passes);
    }
 
+   /**
+    * Force pre-compilation of the kernel for a given device, without executing it.
+    * 
+    * @param _device the device for which the kernel is to be compiled
+    * @return the Kernel instance (this) so we can chain calls
+    * @throws CompileFailedException if compilation failed for some reason
+    */
+   public synchronized Kernel compile(Device _device) throws CompileFailedException {
+      return prepareKernelRunner().compile("run", _device);
+   }
+
+   /**
+    * Force pre-compilation of the kernel for a given device, without executing it.
+    * 
+    * @param _entrypoint is the name of the method we wish to use as the entrypoint to the kernel
+    * @param _device the device for which the kernel is to be compiled
+    * @return the Kernel instance (this) so we can chain calls
+    * @throws CompileFailedException if compilation failed for some reason
+    */
+   public synchronized Kernel compile(String _entrypoint, Device _device) throws CompileFailedException {
+      return prepareKernelRunner().compile(_entrypoint, _device);
+   }
+   
+   /**
+    * Retrieves that minimum private memory in use per work item for this kernel instance and 
+    * the specified device.
+    * 
+    * @param device the device where the kernel is intended to run
+    * @return the number of bytes used per work item
+    * @throws QueryFailedException if the query couldn't complete
+    */
+   public long getKernelMinimumPrivateMemSizeInUsePerWorkItem(Device device) throws QueryFailedException {
+      return prepareKernelRunner().getKernelMinimumPrivateMemSizeInUsePerWorkItem(device);
+   }
+
+   /**
+    * Retrieves the amount of local memory used in the specified device by this kernel instance.
+    * 
+    * @param device the device where the kernel is intended to run
+    * @return the number of bytes of local memory in use for the specified device and current kernel 
+    * @throws QueryFailedException if the query couldn't complete
+    */
+   public long getKernelLocalMemSizeInUse(Device device) throws QueryFailedException {
+      return prepareKernelRunner().getKernelLocalMemSizeInUse(device);
+   }
+   
+   /**
+    * Retrieves the preferred work-group multiple in the specified device for this kernel instance.
+    * 
+    * @param device the device where the kernel is intended to run
+    * @return the preferred work group multiple
+    * @throws QueryFailedException if the query couldn't complete
+    */
+   public int getKernelPreferredWorkGroupSizeMultiple(Device device) throws QueryFailedException {
+      return prepareKernelRunner().getKernelPreferredWorkGroupSizeMultiple(device);
+   }
+   
+   /**
+    * Retrieves the maximum work-group size allowed for this kernel when running on the specified device.
+    * 
+    * @param device the device where the kernel is intended to run
+    * @return the preferred work group multiple
+    * @throws QueryFailedException if the query couldn't complete
+    */
+   public int getKernelMaxWorkGroupSize(Device device) throws QueryFailedException {
+      return prepareKernelRunner().getKernelMaxWorkGroupSize(device);
+   }
+   
+   /**
+    * Retrieves the specified work-group size in the compiled kernel for the specified device or intermediate language for the device.
+    * 
+    * @param device the device where the kernel is intended to run
+    * @return the preferred work group multiple
+    * @throws QueryFailedException if the query couldn't complete
+    */
+   public int[] getKernelCompileWorkGroupSize(Device device) throws QueryFailedException {
+      return prepareKernelRunner().getKernelCompileWorkGroupSize(device);
+   }
+   
    public boolean isAutoCleanUpArrays() {
       return autoCleanUpArrays;
    }
@@ -2668,8 +3124,13 @@ public abstract class Kernel implements Cloneable {
       final String strRetClass = retClass.toString();
       final String mapping = typeToLetterMap.get(strRetClass);
       // System.out.println("strRetClass = <" + strRetClass + ">, mapping = " + mapping);
-      if (mapping == null)
-         return "[" + retClass.getName() + ";";
+      if (mapping == null) {
+	  if (retClass.isArray()) {
+             return "[" + retClass.getName() + ";";
+    	  } else {
+             return "L" + retClass.getName() + ";";
+    	  }
+      }
       return mapping;
    }
 
@@ -3355,7 +3816,7 @@ public abstract class Kernel implements Cloneable {
 
    private static String toSignature(MethodReferenceEntry methodReferenceEntry) {
       NameAndTypeEntry nameAndTypeEntry = methodReferenceEntry.getNameAndTypeEntry();
-      return nameAndTypeEntry.getNameUTF8Entry().getUTF8() + nameAndTypeEntry.getDescriptorUTF8Entry().getUTF8();
+      return nameAndTypeEntry.getNameUTF8Entry().getUTF8().replace('/', '.') + nameAndTypeEntry.getDescriptorUTF8Entry().getUTF8().replace('/', '.');
    }
 
    private static final ValueCache<Class<?>, Map<String, String>, RuntimeException> mappedMethodNamesCache = cacheProperty(new ValueComputer<Class<?>, Map<String, String>>() {

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,16 +36,25 @@ import com.aparapi.internal.util.Reflection;
 public class KernelManager {
 
    private static KernelManager INSTANCE = new KernelManager();
-   private LinkedHashMap<Integer, PreferencesWrapper> preferences = new LinkedHashMap<>();
+   private LinkedHashMap<Class<? extends Kernel>, PreferencesWrapper> preferences = new LinkedHashMap<>();
    private LinkedHashMap<Class<? extends Kernel>, KernelProfile> profiles = new LinkedHashMap<>();
    private LinkedHashMap<Class<? extends Kernel>, Kernel> sharedInstances = new LinkedHashMap<>();
 
    private KernelPreferences defaultPreferences;
 
    protected KernelManager() {
-      defaultPreferences = createDefaultPreferences();
+      setup();
    }
 
+   /**
+    * Default KernelManager initialization.<br/>
+    * Convenience method for being overridden to an empty implementation, so that derived 
+    * KernelManager classes can provide non static parameters to their constructors.
+    */
+   protected void setup() {
+	   defaultPreferences = createDefaultPreferences(); 
+   }
+   
    public static KernelManager instance() {
       return INSTANCE;
    }
@@ -148,13 +157,13 @@ public class KernelManager {
 
    public KernelPreferences getPreferences(Kernel kernel) {
       synchronized (preferences) {
-         PreferencesWrapper wrapper = preferences.get(kernel.hashCode());
+         PreferencesWrapper wrapper = preferences.get(kernel.getClass());
          KernelPreferences kernelPreferences;
          if (wrapper == null) {
             kernelPreferences = new KernelPreferences(this, kernel.getClass());
-            preferences.put(kernel.hashCode(), new PreferencesWrapper(kernel.getClass(), kernelPreferences));
+            preferences.put(kernel.getClass(), new PreferencesWrapper(kernel.getClass(), kernelPreferences));
          }else{
-           kernelPreferences = preferences.get(kernel.hashCode()).getPreferences();
+           kernelPreferences = preferences.get(kernel.getClass()).getPreferences();
          }
          return kernelPreferences;
       }

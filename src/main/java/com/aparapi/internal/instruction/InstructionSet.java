@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1276,7 +1276,7 @@ public class InstructionSet{
       @Override public boolean isDeclaration() {
          LocalVariableInfo lvi = method.getLocalVariableTableEntry().getVariable(getThisPC() + getLength(),
                getLocalVariableTableIndex());
-         return (lvi.getStart() == getThisPC() + getLength());
+             return (lvi != null) && (lvi.getStart() == getThisPC() + getLength() || lvi.getStart() == getThisPC());
       }
 
       @Override public String getDescription() {
@@ -3507,7 +3507,7 @@ public class InstructionSet{
    public static class I_SIPUSH extends ImmediateConstant<Integer>{
       public I_SIPUSH(MethodModel _methodPoolEntry, ByteReader _byteReader, boolean _wide) {
          super(_methodPoolEntry, ByteCode.SIPUSH, _byteReader, _wide);
-         value = _byteReader.u2();
+         value = _byteReader.s2();
       }
 
       @Override public String getDescription() {

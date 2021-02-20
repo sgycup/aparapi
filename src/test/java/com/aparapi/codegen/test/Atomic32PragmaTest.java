@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@ public class Atomic32PragmaTest extends com.aparapi.codegen.CodeGenJUnitBase {
 " #pragma OPENCL EXTENSION cl_khr_global_int32_extended_atomics : enable\n" +
 " #pragma OPENCL EXTENSION cl_khr_local_int32_base_atomics : enable\n" +
 " #pragma OPENCL EXTENSION cl_khr_local_int32_extended_atomics : enable\n" +
+" #define atomicGet(p) (*p)\n" + 
+" #define atomicSet(p, val) (*p=val)\n" +
 " int atomicAdd(__global int *_arr, int _index, int _delta){\n" +
 " return atomic_add(&_arr[_index], _delta);\n" +
 " }\n" +

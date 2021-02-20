@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,13 @@ package com.aparapi.runtime;
 
 import java.util.Arrays;
 
-public class Util {
+import com.aparapi.internal.kernel.KernelManager;
+
+public class Util {	
+	public static void resetKernelManager() {
+		KernelManager.setKernelManager(new OriginalKernelManager());
+	}
+	
     static void fill(int[] array, Filler _filler) {
         for (int i = 0; i < array.length; i++) {
             _filler.fill(array, i);

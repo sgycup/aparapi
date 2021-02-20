@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ public class ContinueTorture {
     public void run() {
         int idx = myId;
         while (--idx > 0) {
-
             if (myId == 0) {
                 continue;
             }
@@ -49,4 +48,4 @@ public class ContinueTorture {
         }
     }
 }
-//**{Throws{ClassParseException}Throws}**/
+//**{Throws{CodeGenException}Throws}**/

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import com.aparapi.Kernel;
 import com.aparapi.Range;
 import com.aparapi.device.Device;
 import com.aparapi.device.OpenCLDevice;
+import com.aparapi.exception.QueryFailedException;
 import com.aparapi.internal.kernel.KernelManager;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -42,10 +43,14 @@ public class BufferTransferTest {
     }
 
     @Test
-    public void inOutOnce() {
+    public void testInOutOnce() throws QueryFailedException {
 
-        final int SIZE = 1024;
+        int SIZE = 1024;
         final InOutKernel kernel = new InOutKernel();
+        int maxSize = kernel.getKernelMaxWorkGroupSize(openCLDevice);
+        if (maxSize < SIZE) {
+           SIZE = maxSize;
+        }
         final Range range = openCLDevice.createRange(SIZE);
 
         kernel.in = new int[SIZE];
@@ -63,10 +68,14 @@ public class BufferTransferTest {
     }
 
     @Test
-    public void auto() {
+    public void testAuto() throws QueryFailedException {
 
-        final int SIZE = 1024;
+        int SIZE = 1024;
         final AddKernel kernel = new AddKernel();
+        int maxSize = kernel.getKernelMaxWorkGroupSize(openCLDevice);
+        if (maxSize < SIZE) {
+           SIZE = maxSize;
+        }
         final Range range = openCLDevice.createRange(SIZE);
 
         kernel.values = new int[SIZE];
@@ -111,10 +120,14 @@ public class BufferTransferTest {
     }
 
     @Test
-    public void explicit() {
+    public void testExplicit() throws QueryFailedException {
 
-        final int SIZE = 1024;
+        int SIZE = 1024;
         final AddKernel kernel = new AddKernel();
+        int maxSize = kernel.getKernelMaxWorkGroupSize(openCLDevice);
+        if (maxSize < SIZE) {
+           SIZE = maxSize;
+        }        
         kernel.setExplicit(true);
         final Range range = openCLDevice.createRange(SIZE);
 
@@ -171,7 +184,7 @@ public class BufferTransferTest {
     }
 
     @Test
-    public void issue60Explicit() {
+    public void testExplicitSimple() {
 
         TestKernel kernel = new TestKernel();
         kernel.setExplicit(true);
@@ -180,7 +193,7 @@ public class BufferTransferTest {
     }
 
     @Test
-    public void issue60Auto() {
+    public void testAutoSimple() {
         TestKernel kernel = new TestKernel();
         kernel.step();
 
@@ -249,10 +262,6 @@ public class BufferTransferTest {
                 for (int n = 0; n < neuronOutputs.length; n++)
                     log[n][simStep[0]] = neuronOutputs[n];
             }
-            System.out.println(getTargetDevice().getShortDescription() + (isExplicit() ? ", explicit" : ", auto"));
-
-            for (int n = 0; n < neuronOutputs.length; n++)
-                System.out.println(Arrays.toString(log[n]));
 
             assertTrue("log[2] == expected", Util.same(log[2], expected));
         }

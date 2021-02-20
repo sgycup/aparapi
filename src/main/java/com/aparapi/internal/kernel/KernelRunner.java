@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,6 +56,10 @@ import com.aparapi.*;
 import com.aparapi.Kernel.Constant;
 import com.aparapi.Kernel.*;
 import com.aparapi.device.*;
+import com.aparapi.exception.AparapiBrokenBarrierException;
+import com.aparapi.exception.AparapiKernelFailedException;
+import com.aparapi.exception.CompileFailedException;
+import com.aparapi.exception.QueryFailedException;
 import com.aparapi.internal.annotation.*;
 import com.aparapi.internal.exception.*;
 import com.aparapi.internal.instruction.InstructionSet.*;
@@ -65,11 +69,15 @@ import com.aparapi.internal.util.*;
 import com.aparapi.internal.writer.*;
 import com.aparapi.opencl.*;
 
+import java.lang.Thread.UncaughtExceptionHandler;
 import java.lang.reflect.*;
 import java.nio.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ForkJoinPool.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.*;
 
 /**
@@ -109,7 +117,7 @@ public class KernelRunner extends KernelRunnerJNI{
    private final Kernel kernel;
 
    private Entrypoint entryPoint;
-
+   
    private int argc;
 
    // may be read by a thread other than the control thread, hence volatile
@@ -144,12 +152,26 @@ public class KernelRunner extends KernelRunnerJNI{
          return newThread;
       }
    };
-
-   private static final ForkJoinPool threadPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors(),
-         lowPriorityThreadFactory, null, false);
+   
+   final private ThreadDiedHandler handler = new ThreadDiedHandler();
+   //Allow a thread pool per KernelRunner which will also be per Kernel instance 
+   private final ForkJoinPool threadPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors(),
+         lowPriorityThreadFactory, handler, false);
    private static HashMap<Class<? extends Kernel>, String> openCLCache = new HashMap<>();
    private static LinkedHashSet<String> seenBinaryKeys = new LinkedHashSet<>();
 
+   private class ThreadDiedHandler implements UncaughtExceptionHandler {
+	   private AtomicLong threadsDiedCounter = new AtomicLong(0); 
+	   @Override
+	   public void uncaughtException(Thread t, Throwable e) {
+			logger.log(Level.SEVERE, "Thread died in thread pool of kernel runner for kernel: " + kernel.getClass(), e);
+			threadsDiedCounter.incrementAndGet();
+	   }
+   }
+   
+   private final Hashtable<Device, Boolean> kernelIsCompiledForDeviceHash = new Hashtable<Device, Boolean>();
+   private final Hashtable<Device, Boolean> kernelNeverExecutedForDeviceHash = new Hashtable<Device, Boolean>();
+   
    /**
     * Create a KernelRunner for a specific Kernel instance.
     * 
@@ -211,6 +233,72 @@ public class KernelRunner extends KernelRunnerJNI{
       //      threadPool.shutdownNow();
    }
 
+   public long getKernelMinimumPrivateMemSizeInUsePerWorkItem(Device device) throws QueryFailedException {
+      if (device != null && !(device instanceof OpenCLDevice)) {
+         return 0;
+      } else {
+         try {
+            compile("run", device);
+            return getKernelMinimumPrivateMemSizeInUsePerWorkItemJNI(jniContextHandle);
+         } catch (CompileFailedException ex) {
+            throw new QueryFailedException("Failed to query kernel MinimumPrivateMemSizeInUsePerWorkItem", ex); 
+         }
+      }
+   }
+   
+   public long getKernelLocalMemSizeInUse(Device device) throws QueryFailedException {
+      if (device != null && !(device instanceof OpenCLDevice)) {
+         return 0;
+      } else {
+         try {
+            compile("run", device);
+            return getKernelLocalMemSizeInUseJNI(jniContextHandle);
+         } catch (CompileFailedException ex) {
+            throw new QueryFailedException("Failed to query kernel LocalMemSizeInUse", ex); 
+         }
+      }
+   }
+   
+   public int getKernelPreferredWorkGroupSizeMultiple(Device device) throws QueryFailedException {
+      if (device != null && !(device instanceof OpenCLDevice)) {
+         return 1;
+      } else {
+         try {
+            compile("run", device);
+            return getKernelPreferredWorkGroupSizeMultipleJNI(jniContextHandle);
+         } catch (CompileFailedException ex) {
+            throw new QueryFailedException("Failed to query kernel PreferredWorkGroupSizeMultiple", ex); 
+         }
+      }
+   }
+   
+   public int getKernelMaxWorkGroupSize(Device device) throws QueryFailedException {
+      if (device != null && !(device instanceof OpenCLDevice)) {
+         return device.getMaxWorkGroupSize();
+      } else {
+         try {
+            compile("run", device);
+            return getKernelMaxWorkGroupSizeJNI(jniContextHandle);
+         } catch (CompileFailedException ex) {
+            throw new QueryFailedException("Failed to query kernel MaxWorkGroupSize", ex); 
+         }
+      }
+   }
+   
+   public int[] getKernelCompileWorkGroupSize(Device device) throws QueryFailedException {
+      final int[] unknownCompileWorkGroupSize = {0, 0, 0};
+      if (device != null && !(device instanceof OpenCLDevice)) {
+         return unknownCompileWorkGroupSize;
+      } else {
+         try {
+            compile("run", device);
+            return getKernelCompileWorkGroupSizeJNI(jniContextHandle);
+         } catch (CompileFailedException ex) {
+            throw new QueryFailedException("Failed to query kernel CompileWorkGroupSize", ex); 
+         }
+      }
+   }
+ 
    private Set<String> capabilitiesSet;
 
    boolean hasFP64Support() {
@@ -297,42 +385,80 @@ public class KernelRunner extends KernelRunnerJNI{
       return capabilitiesSet.contains(OpenCL.CL_KHR_GL_SHARING);
    }
 
-   private static final class FJSafeCyclicBarrier extends CyclicBarrier{
-      FJSafeCyclicBarrier(final int threads) {
-         super(threads);
+   private static final class FJSafeBarrier implements IKernelBarrier {
+	  final int threads;
+	  final AtomicBoolean brokenBarrier = new AtomicBoolean(false);
+	  final AtomicBoolean canceled = new AtomicBoolean(false);
+	  final Object lock = new Object();
+	  int remainingThreads;
+	  
+      FJSafeBarrier(final int threads) {
+         remainingThreads = threads;
+         this.threads = threads;
+      }
+      
+      /**
+       * Should be called by worker threads when a fatal exception occurs,
+       * so that all threads fail-fast and no deadlock occurs.
+       */
+      public void breakBarrier(final Throwable e) {
+    	  synchronized (lock) {
+    		  brokenBarrier.set(true);
+    		  lock.notifyAll();
+    	  }
+      }
+      
+      public void cancelBarrier() {
+    	  synchronized (lock) {
+			  remainingThreads = threads;
+			  canceled.set(true);
+    		  lock.notifyAll();
+    	  }
       }
 
-      @Override public int await() throws InterruptedException, BrokenBarrierException {
-         class Awaiter implements ManagedBlocker{
-            private int value;
+      @Override
+      public boolean block() throws InterruptedException {
+    	  if (canceled.get()) {
+    		  return true;
+    	  }
+    	  
+		  synchronized (lock) {
+			  remainingThreads--;
+			  if (remainingThreads < 0) {
+				  throw new Error("Thread count cannot be less than 0");
+			  }
 
-            private boolean released;
-
-            @Override public boolean block() throws InterruptedException {
-               try {
-                  value = superAwait();
-                  released = true;
-                  return true;
-               } catch (final BrokenBarrierException e) {
-                  throw new RuntimeException(e);
-               }
-            }
-
-            @Override public boolean isReleasable() {
-               return released;
-            }
-
-            int getValue() {
-               return value;
-            }
-         }
-         final Awaiter awaiter = new Awaiter();
-         ForkJoinPool.managedBlock(awaiter);
-         return awaiter.getValue();
+			 if (!brokenBarrier.get() && remainingThreads > 0) {
+				 try {
+					 lock.wait();
+				 } catch (InterruptedException e) {
+					 //Either lock is already completed or thread will have to re-lock 
+					 if (remainingThreads != threads) {
+						 //This thread will have to re-lock for the same barrier event
+						 remainingThreads++;
+						 throw e;
+					 }
+				 }
+			 } else {
+				//InterruptedException will never occur here, thus lock completion is guaranteed
+				remainingThreads = threads;
+   			  	lock.notifyAll();
+			 }
+		  }
+    	  
+    	  //Breaking barrier at this point, allows barrier to be reused, if needed...
+    	  if (brokenBarrier.get()) {
+    		  throw new AparapiBrokenBarrierException("Barrier was broken");
+    	  }
+    	  
+    	  //Threads are always ready to be released at this point
+    	  return true;
       }
-
-      int superAwait() throws InterruptedException, BrokenBarrierException {
-         return super.await();
+      
+      @Override
+      public boolean isReleasable() {
+    	  //Ensure block() is always called by ForkJoinPool
+    	  return false;
       }
    }
 
@@ -352,7 +478,7 @@ public class KernelRunner extends KernelRunnerJNI{
       boolean legacySequentialMode = kernel.getExecutionMode().equals(Kernel.EXECUTION_MODE.SEQ);
 
       passId = PASS_ID_PREPARING_EXECUTION;
-      _settings.profile.onEvent(ProfilingEvent.PREPARE_EXECUTE);
+      _settings.profile.onEvent(device, ProfilingEvent.PREPARE_EXECUTE);
 
       try {
          if (device == JavaDevice.ALTERNATIVE_ALGORITHM) {
@@ -362,7 +488,7 @@ public class KernelRunner extends KernelRunnerJNI{
                }
             } else {
                boolean silently = true; // not having an alternative algorithm is the normal state, and does not need reporting
-               fallBackToNextDevice(_settings, (Exception) null, silently);
+               fallBackToNextDevice(device, _settings, (Exception) null, silently);
             }
          } else {
             final int localSize0 = _settings.range.getLocalSize(0);
@@ -392,7 +518,7 @@ public class KernelRunner extends KernelRunnerJNI{
                kernelState.setLocalId(0, 0);
                kernelState.setLocalId(1, 0);
                kernelState.setLocalId(2, 0);
-               kernelState.setLocalBarrier(new FJSafeCyclicBarrier(1));
+               kernelState.setLocalBarrier(new FJSafeBarrier(1));
 
                for (passId = 0; passId < _settings.passes; passId++) {
                   if (getCancelState() == CANCEL_STATUS_TRUE) {
@@ -443,12 +569,7 @@ public class KernelRunner extends KernelRunnerJNI{
                final int numGroups0 = _settings.range.getNumGroups(0);
                final int numGroups1 = _settings.range.getNumGroups(1);
                final int globalGroups = numGroups0 * numGroups1 * _settings.range.getNumGroups(2);
-               /**
-                * This joinBarrier is the barrier that we provide for the kernel threads to rendezvous with the current dispatch thread.
-                * So this barrier is threadCount+1 wide (the +1 is for the dispatch thread)
-                */
-               final CyclicBarrier joinBarrier = new FJSafeCyclicBarrier(threads + 1);
-
+               
                /**
                 * This localBarrier is only ever used by the kernels.  If the kernel does not use the barrier the threads
                 * can get out of sync, we promised nothing in JTP mode.
@@ -460,7 +581,7 @@ public class KernelRunner extends KernelRunnerJNI{
                 *
                 * This barrier is threadCount wide.  We never hit the barrier from the dispatch thread.
                 */
-               final CyclicBarrier localBarrier = new FJSafeCyclicBarrier(threads);
+               final FJSafeBarrier localBarrier = new FJSafeBarrier(threads);
 
                final ThreadIdSetter threadIdSetter;
 
@@ -548,14 +669,24 @@ public class KernelRunner extends KernelRunnerJNI{
                      @Override
                      public void set(KernelState kernelState, int globalGroupId, int threadId) {
                         //                   (kernelState, globalGroupId, threadId) ->{
-                        kernelState.setLocalId(0, (threadId % localSize0)); // threadId % localWidth =  (for 33 = 1 % 4 = 1)
-                        kernelState.setLocalId(1, (threadId / localSize0)); // threadId / localWidth = (for 33 = 1 / 4 == 0)
+                    	final int localId0 = (threadId % localSize0);
+                    	final int localId1 = (threadId / localSize0);
+                        kernelState.setLocalId(0, localId0); // threadId % localWidth =  (for 33 = 1 % 4 = 1)
+                        kernelState.setLocalId(1, localId1); // threadId / localWidth = (for 33 = 1 / 4 == 0)
 
-                        final int groupInset = globalGroupId % numGroups0; // 4%3 = 1
-                        kernelState.setGlobalId(0, ((groupInset * localSize0) + kernelState.getLocalIds()[0])); // 1*4+1=5
+                        //The displacement in the overall 2D computation grid in the X direction is
+                        //the offset in X given by the current group being executed, plus the X displacement
+                        //inside that work-group.
+                        //Groups are like this:
+                        //[Group 0] [Group 1] [Group 2]
+                        //[Group 3] [Group 4] [Group 5]
+                        final int globalThreadIdOffsetX = (globalGroupId % numGroups0) * localSize0; 
+                        kernelState.setGlobalId(0, globalThreadIdOffsetX + localId0);
 
-                        final int completeLines = (globalGroupId / numGroups0) * localSize1;// (4/3) * 2
-                        kernelState.setGlobalId(1, (completeLines + kernelState.getLocalIds()[1])); // 2+0 = 2
+                        //Likewise X, but now for the Y direction. 
+                        final int globalThreadIdOffsetY = (globalGroupId / numGroups0) * localSize1;
+                        kernelState.setGlobalId(1, globalThreadIdOffsetY + localId1);
+                        
                         kernelState.setGroupId(0, (globalGroupId % numGroups0));
                         kernelState.setGroupId(1, (globalGroupId / numGroups0));
                      }
@@ -588,12 +719,17 @@ public class KernelRunner extends KernelRunnerJNI{
                      }
                   };
                }
-               else
+               else {
                   throw new IllegalArgumentException("Expected 1,2 or 3 dimensions, found " + _settings.range.getDims());
+               }
+               
+               ForkJoinTask<?>[] tasks = new ForkJoinTask<?>[threads];
                for (passId = 0; passId < _settings.passes; passId++) {
                   if (getCancelState() == CANCEL_STATUS_TRUE) {
                      break;
                   }
+                  
+                  long deadThreadCount = handler.threadsDiedCounter.get();
                   /**
                    * Note that we emulate OpenCL by creating one thread per localId (across the group).
                    *
@@ -645,7 +781,7 @@ public class KernelRunner extends KernelRunnerJNI{
                         kernelState.setLocalBarrier(localBarrier);
                      }
 
-                     threadPool.submit(
+                     ForkJoinTask<?> fjt = threadPool.submit(
                      //                     () -> {
                      new Runnable() {
                         public void run() {
@@ -654,18 +790,27 @@ public class KernelRunner extends KernelRunnerJNI{
                                  threadIdSetter.set(kernelState, globalGroupId, threadId);
                                  kernelClone.run();
                               }
-                           }
-                           catch (RuntimeException | Error e) {
-                              logger.log(Level.SEVERE, "Execution failed", e);
-                           }
-                           finally {
-                              await(joinBarrier); // This thread will rendezvous with dispatch thread here. This is effectively a join.
+                           } catch (AparapiBrokenBarrierException e) {
+                        	   //Intentionally empty to not obfuscate threads that failed executing the kernel with those that had
+                        	   //the barrier broken by the first ones.
+                           } catch (RuntimeException | Error e) {
+                        	  localBarrier.breakBarrier(e);
+                        	  throw new AparapiKernelFailedException(kernelState.describe(), e);
                            }
                         }
                      });
+                     
+                     tasks[id] = fjt;
                   }
 
-                  await(joinBarrier); // This dispatch thread waits for all worker threads here.
+                  for (ForkJoinTask<?> task : tasks) { // This dispatch thread waits for all worker threads here.
+                	  task.join();
+                  }
+                  
+                  long deathCount = handler.threadsDiedCounter.get() - deadThreadCount;
+                  if (deathCount > 0) {
+                	  logger.log(Level.SEVERE, "(" + deathCount + ") Pool threads died during execution of kernel: " + kernel.getClass().getName() + " at pass: " + passId);
+                  }
                }
                passId = PASS_ID_COMPLETED_EXECUTION;
             } // execution mode == JTP
@@ -675,21 +820,67 @@ public class KernelRunner extends KernelRunnerJNI{
       }
    }
 
-   private static void await(CyclicBarrier _barrier) {
-      try {
-         _barrier.await();
-      } catch (final InterruptedException e) {
-         // TODO Auto-generated catch block
-         e.printStackTrace();
-      } catch (final BrokenBarrierException e) {
-         // TODO Auto-generated catch block
-         e.printStackTrace();
-      }
-   }
-
    private KernelArg[] args = null;
 
    private boolean usesOopConversion = false;
+
+   /**
+    * Helper method to retrieve the class model from a kernel argument. 
+    * @param arg the kernel argument
+    * @param arrayClass the array Java class for the argument 
+    * @return the Aparapi ClassModel instance.
+    */
+   private ClassModel getClassModelFromArg(KernelArg arg, final Class<?> arrayClass) {
+	  ClassModel c = null;
+      if (arg.getObjArrayElementModel() == null) {
+          final String tmp = arrayClass.getName().substring(2).replace('/', '.');
+          final String arrayClassInDotForm = tmp.substring(0, tmp.length() - 1);
+
+          if (logger.isLoggable(Level.FINE)) {
+             logger.fine("looking for type = " + arrayClassInDotForm);
+          }
+
+          // get ClassModel of obj array from entrypt.objectArrayFieldsClasses
+          c = entryPoint.getObjectArrayFieldsClasses().get(arrayClassInDotForm);
+          arg.setObjArrayElementModel(c);
+       } else {
+          c = arg.getObjArrayElementModel();
+       }
+       assert c != null : "should find class for elements " + arrayClass.getName();
+       
+       return c;
+   }
+   
+   /**
+    * Helper method that manages the memory allocation for storing the kernel argument data,
+    * so that the data can be exchanged between the host and the OpenCL device.  
+    * @param arg the kernel argument
+    * @param newRef the actual Java data instance
+    * @param objArraySize the number of elements in the Java array
+    * @param totalStructSize  the size of each target array element
+    * @param totalBufferSize the total buffer size including memory alignment
+    * @return <ul><li>true, if internal buffer had to be allocated or reallocated holding the data</li>
+    * <li>false, if buffer didn't change and is already allocated</li></ul>
+    */
+   public boolean allocateArrayBufferIfFirstTimeOrArrayChanged(KernelArg arg, Object newRef, 
+		   			final int objArraySize, final int totalStructSize, final int totalBufferSize) {
+	   boolean didReallocate = false;
+	   
+	   if ((arg.getObjArrayBuffer() == null) || (newRef != arg.getArray())) {
+	      final ByteBuffer structBuffer = ByteBuffer.allocate(totalBufferSize);
+	      arg.setObjArrayByteBuffer(structBuffer.order(ByteOrder.LITTLE_ENDIAN));
+	      arg.setObjArrayBuffer(arg.getObjArrayByteBuffer().array());
+	      didReallocate = true;
+	      if (logger.isLoggable(Level.FINEST)) {
+	         logger.finest("objArraySize = " + objArraySize + " totalStructSize= " + totalStructSize + " totalBufferSize="
+	               + totalBufferSize);
+	      }
+	   } else {
+	      arg.getObjArrayByteBuffer().clear();
+	   }
+	   
+	   return didReallocate;
+   }
 
    /**
     * 
@@ -700,24 +891,7 @@ public class KernelRunner extends KernelRunnerJNI{
    private boolean prepareOopConversionBuffer(KernelArg arg) throws AparapiException {
       usesOopConversion = true;
       final Class<?> arrayClass = arg.getField().getType();
-      ClassModel c = null;
-      boolean didReallocate = false;
-
-      if (arg.getObjArrayElementModel() == null) {
-         final String tmp = arrayClass.getName().substring(2).replace('/', '.');
-         final String arrayClassInDotForm = tmp.substring(0, tmp.length() - 1);
-
-         if (logger.isLoggable(Level.FINE)) {
-            logger.fine("looking for type = " + arrayClassInDotForm);
-         }
-
-         // get ClassModel of obj array from entrypt.objectArrayFieldsClasses
-         c = entryPoint.getObjectArrayFieldsClasses().get(arrayClassInDotForm);
-         arg.setObjArrayElementModel(c);
-      } else {
-         c = arg.getObjArrayElementModel();
-      }
-      assert c != null : "should find class for elements " + arrayClass.getName();
+      ClassModel c = getClassModelFromArg(arg, arrayClass);
 
       final int arrayBaseOffset = UnsafeWrapper.arrayBaseOffset(arrayClass);
       final int arrayScale = UnsafeWrapper.arrayIndexScale(arrayClass);
@@ -742,18 +916,7 @@ public class KernelRunner extends KernelRunnerJNI{
       final int totalBufferSize = objArraySize * totalStructSize;
 
       // allocate ByteBuffer if first time or array changed
-      if ((arg.getObjArrayBuffer() == null) || (newRef != arg.getArray())) {
-         final ByteBuffer structBuffer = ByteBuffer.allocate(totalBufferSize);
-         arg.setObjArrayByteBuffer(structBuffer.order(ByteOrder.LITTLE_ENDIAN));
-         arg.setObjArrayBuffer(arg.getObjArrayByteBuffer().array());
-         didReallocate = true;
-         if (logger.isLoggable(Level.FINEST)) {
-            logger.finest("objArraySize = " + objArraySize + " totalStructSize= " + totalStructSize + " totalBufferSize="
-                  + totalBufferSize);
-         }
-      } else {
-         arg.getObjArrayByteBuffer().clear();
-      }
+      boolean didReallocate = allocateArrayBufferIfFirstTimeOrArrayChanged(arg, newRef, objArraySize, totalStructSize, totalBufferSize);
 
       // copy the fields that the JNI uses
       arg.setJavaArray(arg.getObjArrayBuffer());
@@ -943,9 +1106,119 @@ public class KernelRunner extends KernelRunnerJNI{
    private void restoreObjects() throws AparapiException {
       for (int i = 0; i < argc; i++) {
          final KernelArg arg = args[i];
-         if ((arg.getType() & ARG_OBJ_ARRAY_STRUCT) != 0) {
+         if (arg.getField().getType() == AtomicInteger[].class) {
+            extractAtomicIntegerConversionBuffer(arg); 
+         } else if ((arg.getType() & ARG_OBJ_ARRAY_STRUCT) != 0) {
             extractOopConversionBuffer(arg);
          }
+      }
+   }
+   
+   private boolean prepareAtomicIntegerConversionBuffer(KernelArg arg) throws AparapiException {
+      usesOopConversion = true;
+      final Class<?> arrayClass = arg.getField().getType();
+      ClassModel c = getClassModelFromArg(arg, arrayClass);
+
+
+      if (logger.isLoggable(Level.FINEST)) {
+         logger.finest("Syncing obj array type = " + arrayClass + " cvtd= " + c.getClassWeAreModelling().getName());
+      }
+
+      int objArraySize = 0;
+      Object newRef = null;
+      try {
+         newRef = arg.getField().get(kernel);
+         objArraySize = Array.getLength(newRef);
+      } catch (final IllegalAccessException e) {
+         throw new AparapiException(e);
+      }
+
+      assert (newRef != null) && (objArraySize != 0) : "no data";
+
+      final int totalStructSize = Integer.BYTES;
+      final int totalBufferSize = objArraySize * totalStructSize;
+
+      // allocate ByteBuffer if first time or array changed
+      boolean didReallocate = allocateArrayBufferIfFirstTimeOrArrayChanged(arg, newRef, objArraySize, totalStructSize, totalBufferSize);
+
+      AtomicInteger[] atomic = (AtomicInteger[])newRef;
+      
+      // copy the fields that the JNI uses
+      arg.setJavaArray(arg.getObjArrayBuffer());
+      arg.setNumElements(objArraySize);
+      arg.setSizeInBytes(totalBufferSize);
+
+      int sizeWritten = 0;
+      for (int j = 0; j < objArraySize; j++) {
+         arg.getObjArrayByteBuffer().putInt(atomic[j].get());
+         sizeWritten += Integer.BYTES;
+
+         // add padding here if needed
+         if (logger.isLoggable(Level.FINEST)) {
+            logger.finest("sizeWritten = " + sizeWritten + " totalStructSize= " + totalStructSize);
+         }
+      }
+      assert sizeWritten <= totalBufferSize : "wrote too much into buffer";
+
+      while (sizeWritten < totalBufferSize) {
+         if (logger.isLoggable(Level.FINEST)) {
+            logger.finest(arg.getName() + " struct pad byte = " + sizeWritten + " totalStructSize= " + totalStructSize);
+          }
+          arg.getObjArrayByteBuffer().put((byte) -1);
+          sizeWritten++;
+      }
+
+      assert arg.getObjArrayByteBuffer().arrayOffset() == 0 : "should be zero";
+
+      return didReallocate;	
+   }
+
+   private void extractAtomicIntegerConversionBuffer(KernelArg arg) throws AparapiException {
+      final Class<?> arrayClass = arg.getField().getType();
+      final ClassModel c = arg.getObjArrayElementModel();
+      assert c != null : "should find class for elements: " + arrayClass.getName();
+      assert arg.getArray() != null : "array is null";
+
+      if (logger.isLoggable(Level.FINEST)) {
+         logger.finest("Syncing field:" + arg.getName() + ", bb=" + arg.getObjArrayByteBuffer() + ", type = " + arrayClass);
+      }
+
+      int objArraySize = 0;
+      try {
+         objArraySize = Array.getLength(arg.getField().get(kernel));
+      } catch (final IllegalAccessException e) {
+         throw new AparapiException(e);
+      }
+
+      assert objArraySize > 0 : "should be > 0";
+
+      final int totalStructSize = Integer.BYTES;
+      final int totalBufferSize = objArraySize * totalStructSize;
+      // assert arg.objArrayBuffer.length == totalBufferSize : "size should match";
+
+      arg.getObjArrayByteBuffer().rewind();
+      
+      AtomicInteger[] atomics = (AtomicInteger[])arg.getArray();
+
+      int sizeWritten = 0;
+      for (int j = 0; j < objArraySize; j++) {
+         // read int value from buffer and store into obj in the array
+         final int x = arg.getObjArrayByteBuffer().getInt();
+         atomics[j].set(x);
+         
+         sizeWritten += Integer.BYTES;
+
+         // add padding here if needed
+         if (logger.isLoggable(Level.FINEST)) {
+            logger.finest("sizeWritten = " + sizeWritten + " totalStructSize= " + totalStructSize);
+         }
+      }
+      assert sizeWritten <= totalBufferSize : "wrote too much into buffer";
+
+      while (sizeWritten < totalBufferSize) {
+         // skip over pad bytes
+         arg.getObjArrayByteBuffer().get();
+         sizeWritten++;
       }
    }
 
@@ -976,7 +1249,9 @@ public class KernelRunner extends KernelRunnerJNI{
                   }
                }
 
-               if ((arg.getType() & ARG_OBJ_ARRAY_STRUCT) != 0) {
+               if (arg.getField().getType() == AtomicInteger[].class) {
+            	  prepareAtomicIntegerConversionBuffer(arg);
+               } else if ((arg.getType() & ARG_OBJ_ARRAY_STRUCT) != 0) {
                   prepareOopConversionBuffer(arg);
                } else {
                   // set up JNI fields for normal arrays
@@ -1041,7 +1316,7 @@ public class KernelRunner extends KernelRunnerJNI{
    }
 
    @SuppressWarnings("deprecation")
-   private Kernel executeOpenCL(ExecutionSettings _settings) throws AparapiException {
+   private Kernel executeOpenCL(Device device, ExecutionSettings _settings) throws AparapiException {
 
       // Read the array refs after kernel may have changed them
       // We need to do this as input to computing the localSize
@@ -1055,7 +1330,7 @@ public class KernelRunner extends KernelRunnerJNI{
       int returnValue = runKernelJNI(jniContextHandle, _settings.range, needSync, _settings.passes, inBufferRemote, outBufferRemote);
       if (returnValue != 0) {
          String reason = "OpenCL execution seems to have failed (runKernelJNI returned " + returnValue + ")";
-         return fallBackToNextDevice(_settings, new AparapiException(reason));
+         return fallBackToNextDevice(device, _settings, new AparapiException(reason));
       }
 
       if (usesOopConversion == true) {
@@ -1081,7 +1356,12 @@ public class KernelRunner extends KernelRunnerJNI{
          kernel.setFallbackExecutionMode();
       }
       recreateRange(_settings);
-      return executeInternalInner(_settings);
+      try {
+         return executeInternalInner(_settings, null, false);
+      } catch (CompileFailedException e) {
+         logger.log(Level.SEVERE, "KernelRunner#fallBackByExecutionMode() this should never happen...", e);
+         throw new IllegalStateException("This should never happen, since compileOnly is set to false", e);
+      }
    }
 
    private void recreateRange(ExecutionSettings _settings) {
@@ -1109,19 +1389,19 @@ public class KernelRunner extends KernelRunnerJNI{
       }
    }
 
-   private Kernel fallBackToNextDevice(ExecutionSettings _settings, String _reason) {
-      return fallBackToNextDevice(_settings, new AparapiException(_reason));
+   private Kernel fallBackToNextDevice(Device device, ExecutionSettings _settings, String _reason) {
+      return fallBackToNextDevice(device, _settings, new AparapiException(_reason));
    }
 
    @SuppressWarnings("deprecation")
-   synchronized private Kernel fallBackToNextDevice(ExecutionSettings _settings, Exception _exception) {
-      return fallBackToNextDevice(_settings, _exception, false);
+   synchronized private Kernel fallBackToNextDevice(Device device, ExecutionSettings _settings, Exception _exception) {
+      return fallBackToNextDevice(device, _settings, _exception, false);
    }
 
    @SuppressWarnings("deprecation")
-   synchronized private Kernel fallBackToNextDevice(ExecutionSettings _settings, Exception _exception, boolean _silently) {
+   synchronized private Kernel fallBackToNextDevice(Device device, ExecutionSettings _settings, Exception _exception, boolean _silently) {
       isFallBack = true;
-      _settings.profile.onEvent(ProfilingEvent.EXECUTED);
+      _settings.profile.onEvent(device, ProfilingEvent.EXECUTED);
       if (_settings.legacyExecutionMode) {
          if (!_silently && logger.isLoggable(Level.WARNING)) {
             logger.warning("Execution mode " + kernel.getExecutionMode() + " failed for " + kernel + ": " + _exception.getMessage());
@@ -1134,7 +1414,9 @@ public class KernelRunner extends KernelRunnerJNI{
             logger.warning("Device failed for " + kernel + ": " + _exception.getMessage());
          }
 
-         preferences.markPreferredDeviceFailed();
+         //This method is synchronized thus ensuring thread safety on concurrent executions of the same kernel class,
+         //since preferences is shared between such threads.
+         preferences.markDeviceFailed(device);
 
 //         Device nextDevice = preferences.getPreferredDevice(kernel);
 //
@@ -1151,7 +1433,12 @@ public class KernelRunner extends KernelRunnerJNI{
       }
 
       recreateRange(_settings);
-      return executeInternalInner(_settings);
+      try {
+         return executeInternalInner(_settings, null, false);
+      } catch (CompileFailedException e) {
+         logger.log(Level.SEVERE, "KernelRunner#fallBackToNextDevice() this should never happen, since compileOnly is set to false...", e);
+         throw new IllegalStateException("This should never happen, since compileOnly is set to false", e);
+      }
    }
 
    @SuppressWarnings("deprecation")
@@ -1164,20 +1451,27 @@ public class KernelRunner extends KernelRunnerJNI{
          boolean legacyExecutionMode = kernel.getExecutionMode() != Kernel.EXECUTION_MODE.AUTO;
 
          ExecutionSettings settings = new ExecutionSettings(preferences, profile, _entrypoint, _range, _passes, legacyExecutionMode);
-         // Two Kernels of the same class share the same KernelPreferences object, and since failure (fallback) generally mutates
-         // the preferences object, we must lock it. Note this prevents two Kernels of the same class executing simultaneously.
-         synchronized (preferences) {
-            return executeInternalOuter(settings);
-         }
+         return executeInternalOuter(settings);
       } finally {
          executing = false;
          clearCancelMultiPass();
       }
    }
+   
+   public synchronized Kernel compile(String _entrypoint, final Device device) throws CompileFailedException {
+      KernelProfile profile = KernelManager.instance().getProfile(kernel.getClass());
+      KernelPreferences preferences = KernelManager.instance().getPreferences(kernel);
+      Range range = new Range(device, 1);
+	   ExecutionSettings settings = new ExecutionSettings(preferences, profile, _entrypoint, range, 1, false);
+	   return executeInternalInner(settings, device, true);
+   }
 
    private synchronized Kernel executeInternalOuter(ExecutionSettings _settings) {
       try {
-         return executeInternalInner(_settings);
+         return executeInternalInner(_settings, null, false);
+      } catch (CompileFailedException e) {
+         logger.log(Level.SEVERE, "KernelRunner#executeInternalOuter() this should never happen, since compileOnly is set to false...", e);
+         throw new IllegalStateException("This should never happen, since compileOnly is set to false", e);
       } finally {
          if (kernel.isAutoCleanUpArrays() &&_settings.range.getGlobalSize_0() != 0) {
             cleanUpArrays();
@@ -1186,7 +1480,7 @@ public class KernelRunner extends KernelRunnerJNI{
    }
 
    @SuppressWarnings("deprecation")
-   private synchronized Kernel executeInternalInner(ExecutionSettings _settings) {
+   private synchronized Kernel executeInternalInner(ExecutionSettings _settings, Device aparapiDevice, boolean compileOnly) throws CompileFailedException {
 
       if (_settings.range == null) {
          throw new IllegalStateException("range can't be null");
@@ -1194,8 +1488,24 @@ public class KernelRunner extends KernelRunnerJNI{
 
       EXECUTION_MODE requestedExecutionMode = kernel.getExecutionMode();
 
-      if (requestedExecutionMode.isOpenCL() && _settings.range.getDevice() != null && !(_settings.range.getDevice() instanceof OpenCLDevice)) {
-         fallBackToNextDevice(_settings, "OpenCL EXECUTION_MODE was requested but Device supplied was not an OpenCLDevice");
+      if (!compileOnly && requestedExecutionMode.isOpenCL() && _settings.range.getDevice() != null && !(_settings.range.getDevice() instanceof OpenCLDevice)) {
+         fallBackToNextDevice(_settings.range.getDevice(), _settings, "OpenCL EXECUTION_MODE was requested but Device supplied was not an OpenCLDevice");
+      }
+      
+      if (compileOnly) {
+         if (aparapiDevice == null) {
+            throw new CompileFailedException("A kernel can only be compiled for a specific device, but no concrete device was specified");
+         }
+         
+         if (kernelIsCompiledForDeviceHash.getOrDefault(aparapiDevice, false)) {
+            return kernel;
+         }
+         
+         if (!(aparapiDevice instanceof OpenCLDevice)) {
+            //Nothing to do
+            kernelIsCompiledForDeviceHash.putIfAbsent(aparapiDevice, true);
+            return kernel;
+	     }
       }
 
       Device device = _settings.range.getDevice();
@@ -1228,26 +1538,26 @@ public class KernelRunner extends KernelRunnerJNI{
 
          int jniFlags = 0;
          // for legacy reasons use old logic where Kernel.EXECUTION_MODE is not AUTO
-         if (_settings.legacyExecutionMode && !userSpecifiedDevice && requestedExecutionMode.isOpenCL()) {
+         if (!compileOnly && _settings.legacyExecutionMode && !userSpecifiedDevice && requestedExecutionMode.isOpenCL()) {
             if (requestedExecutionMode.equals(EXECUTION_MODE.GPU)) {
                // Get the best GPU
                openCLDevice = (OpenCLDevice) KernelManager.DeprecatedMethods.bestGPU();
                jniFlags |= JNI_FLAG_USE_GPU; // this flag might be redundant now.
                if (openCLDevice == null) {
-                  return fallBackToNextDevice(_settings, "GPU request can't be honored, no GPU device");
+                  return fallBackToNextDevice(null, _settings, "GPU request can't be honored, no GPU device");
                }
             } else if (requestedExecutionMode.equals(EXECUTION_MODE.ACC)) {
                // Get the best ACC
                openCLDevice = (OpenCLDevice) KernelManager.DeprecatedMethods.bestACC();
                jniFlags |= JNI_FLAG_USE_ACC; // this flag might be redundant now.
                if (openCLDevice == null) {
-                  return fallBackToNextDevice(_settings, "ACC request can't be honored, no ACC device");
+                  return fallBackToNextDevice(null, _settings, "ACC request can't be honored, no ACC device");
                }
             } else {
                // We fetch the first CPU device
                openCLDevice = (OpenCLDevice) KernelManager.DeprecatedMethods.firstDevice(Device.TYPE.CPU);
                if (openCLDevice == null) {
-                  return fallBackToNextDevice(_settings, "CPU request can't be honored, no CPU device");
+                  return fallBackToNextDevice(null, _settings, "CPU request can't be honored, no CPU device");
                }
             }
          } else {
@@ -1265,19 +1575,23 @@ public class KernelRunner extends KernelRunnerJNI{
          /* for backward compatibility reasons we still honor execution mode */
          boolean isOpenCl = requestedExecutionMode.isOpenCL() || device instanceof OpenCLDevice;
          if (isOpenCl) {
-            if ((entryPoint == null) || (isFallBack)) {
+            if (kernelNeverExecutedForDeviceHash.getOrDefault(device, true) || (entryPoint == null) || (isFallBack)) {
                if (entryPoint == null) {
                   try {
                      final ClassModel classModel = ClassModel.createClassModel(kernel.getClass());
                      entryPoint = classModel.getEntrypoint(_settings.entrypoint, kernel);
-                     _settings.profile.onEvent(ProfilingEvent.CLASS_MODEL_BUILT);
+                     _settings.profile.onEvent(device, ProfilingEvent.CLASS_MODEL_BUILT);
                   } catch (final Exception exception) {
-                     _settings.profile.onEvent(ProfilingEvent.CLASS_MODEL_BUILT);
-                     return fallBackToNextDevice(_settings, exception);
+                     _settings.profile.onEvent(device, ProfilingEvent.CLASS_MODEL_BUILT);
+                     if (compileOnly) {
+                        //Cannot fallback in compile only mode
+                        throw new CompileFailedException(exception);
+                     }
+                     return fallBackToNextDevice(device, _settings, exception);
                   }
                }
 
-               if ((entryPoint != null)) {
+               if (!kernelIsCompiledForDeviceHash.getOrDefault(device, false) && (entryPoint != null)) {
                   synchronized (Kernel.class) { // This seems to be needed because of a race condition uncovered with issue #68 http://code.google.com/p/aparapi/issues/detail?id=68
 
                      //  jniFlags |= (Config.enableProfiling ? JNI_FLAG_ENABLE_PROFILING : 0);
@@ -1288,11 +1602,14 @@ public class KernelRunner extends KernelRunnerJNI{
                      // Init the device to check capabilities before emitting the
                      // code that requires the capabilities.
                      jniContextHandle = initJNI(kernel, openCLDevice, jniFlags); // openCLDevice will not be null here
-                     _settings.profile.onEvent(ProfilingEvent.INIT_JNI);
+                     _settings.profile.onEvent(device, ProfilingEvent.INIT_JNI);
                   } // end of synchronized! issue 68
 
                   if (jniContextHandle == 0) {
-                     return fallBackToNextDevice(_settings, "initJNI failed to return a valid handle");
+                     if (compileOnly) {
+                        throw new CompileFailedException("initJNI failed to return a valid handle");
+                     }
+                     return fallBackToNextDevice(device, _settings, "initJNI failed to return a valid handle");
                   }
 
                   final String extensions = getExtensionsJNI(jniContextHandle);
@@ -1308,11 +1625,17 @@ public class KernelRunner extends KernelRunnerJNI{
                   }
 
                   if (entryPoint.requiresDoublePragma() && !hasFP64Support()) {
-                     return fallBackToNextDevice(_settings, "FP64 required but not supported");
+                     if (compileOnly) {
+                        throw new CompileFailedException("FP64 required but not supported");
+                     }
+                     return fallBackToNextDevice(device, _settings, "FP64 required but not supported");
                   }
 
                   if (entryPoint.requiresByteAddressableStorePragma() && !hasByteAddressableStoreSupport()) {
-                     return fallBackToNextDevice(_settings, "Byte addressable stores required but not supported");
+                     if (compileOnly) {
+                        throw new CompileFailedException("Byte addressable stores required but not supported");
+                     }
+                     return fallBackToNextDevice(device, _settings, "Byte addressable stores required but not supported");
                   }
 
                   final boolean all32AtomicsAvailable = hasGlobalInt32BaseAtomicsSupport()
@@ -1320,8 +1643,10 @@ public class KernelRunner extends KernelRunnerJNI{
                         && hasLocalInt32ExtendedAtomicsSupport();
 
                   if (entryPoint.requiresAtomic32Pragma() && !all32AtomicsAvailable) {
-
-                     return fallBackToNextDevice(_settings, "32 bit Atomics required but not supported");
+                     if (compileOnly) {
+                        throw new CompileFailedException("32 bit Atomics required but not supported");
+                     }
+                     return fallBackToNextDevice(device, _settings, "32 bit Atomics required but not supported");
                   }
 
                   String openCL;
@@ -1336,20 +1661,26 @@ public class KernelRunner extends KernelRunnerJNI{
                            else if (Config.enableShowGeneratedOpenCL) {
                               System.out.println(openCL);
                            }
-                           _settings.profile.onEvent(ProfilingEvent.OPENCL_GENERATED);
+                           _settings.profile.onEvent(device, ProfilingEvent.OPENCL_GENERATED);
                            openCLCache.put(kernel.getClass(), openCL);
                         }
                         catch (final CodeGenException codeGenException) {
                            openCLCache.put(kernel.getClass(), CODE_GEN_ERROR_MARKER);
-                           _settings.profile.onEvent(ProfilingEvent.OPENCL_GENERATED);
-                           return fallBackToNextDevice(_settings, codeGenException);
+                           _settings.profile.onEvent(device, ProfilingEvent.OPENCL_GENERATED);
+                           if (compileOnly) {
+                              throw new CompileFailedException(codeGenException);
+                           }
+                           return fallBackToNextDevice(device, _settings, codeGenException);
                         }
                      }
                      else {
                         if (openCL.equals(CODE_GEN_ERROR_MARKER)) {
-                           _settings.profile.onEvent(ProfilingEvent.OPENCL_GENERATED);
+                           _settings.profile.onEvent(device, ProfilingEvent.OPENCL_GENERATED);
                            boolean silently = true; // since we must have already reported the CodeGenException
-                           return fallBackToNextDevice(_settings, null, silently);
+                           if (compileOnly) {
+                              throw new CompileFailedException("Code Gen Error Marker present");
+                           }
+                           return fallBackToNextDevice(device, _settings, null, silently);
                         }
                      }
                   }
@@ -1374,11 +1705,24 @@ public class KernelRunner extends KernelRunnerJNI{
                         }
                      }
                   }
-                  _settings.profile.onEvent(ProfilingEvent.OPENCL_COMPILED);
+                  _settings.profile.onEvent(device, ProfilingEvent.OPENCL_COMPILED);
                   if (handle == 0) {
-                     return fallBackToNextDevice(_settings, "OpenCL compile failed");
+                     if (compileOnly) {
+                        //When compiling a kernel for a specific device device fallback is not allowed
+                        throw new CompileFailedException("OpenCL compile failed");
+                     }
+                     return fallBackToNextDevice(device, _settings, "OpenCL compile failed");
                   }
-
+                  
+                  kernelIsCompiledForDeviceHash.putIfAbsent(device, true);
+                  
+                  if (compileOnly) {
+                     return kernel;
+                  }
+               }
+                  
+               if (entryPoint != null) {
+                  //Pre-compiled kernels that never executed must resume here 
                   args = new KernelArg[entryPoint.getReferencedFields().size()];
                   int i = 0;
 
@@ -1427,7 +1771,7 @@ public class KernelRunner extends KernelRunnerJNI{
                               try {
                                  setMultiArrayType(args[i], type);
                               } catch (AparapiException e) {
-                                 return fallBackToNextDevice(_settings, "failed to set kernel arguement "
+                                 return fallBackToNextDevice(device, _settings, "failed to set kernel arguement "
                                        + args[i].getName() + ".  Aparapi only supports 2D and 3D arrays.");
                               }
                            } else {
@@ -1504,27 +1848,32 @@ public class KernelRunner extends KernelRunnerJNI{
                   argc = i;
 
                   setArgsJNI(jniContextHandle, args, argc);
-                  _settings.profile.onEvent(ProfilingEvent.PREPARE_EXECUTE);
+                  _settings.profile.onEvent(device, ProfilingEvent.PREPARE_EXECUTE);
+                  
+                  kernelNeverExecutedForDeviceHash.putIfAbsent(device, false);
                   try {
-                     executeOpenCL(_settings);
+                     executeOpenCL(device, _settings);
                      isFallBack = false;
                   } catch (final AparapiException e) {
-                     fallBackToNextDevice(_settings, e);
+                     fallBackToNextDevice(device, _settings, e);
                   }
                } else { // (entryPoint != null) && !entryPoint.shouldFallback()
-                  fallBackToNextDevice(_settings, "failed to locate entrypoint");
+                  if (compileOnly) {
+                     throw new CompileFailedException("failed to locate entrypoint");
+                  }
+                  fallBackToNextDevice(device, _settings, "failed to locate entrypoint");
                }
             } else { // (entryPoint == null) || (isFallBack)
                try {
-                  executeOpenCL(_settings);
+                  executeOpenCL(device, _settings);
                   isFallBack = false;
                } catch (final AparapiException e) {
-                  fallBackToNextDevice(_settings, e);
+                  fallBackToNextDevice(device, _settings, e);
                }
             }
          } else { // isOpenCL
             if (!(device instanceof JavaDevice)) {
-               fallBackToNextDevice(_settings, "Non-OpenCL Kernel.EXECUTION_MODE requested but device is not a JavaDevice ");
+               fallBackToNextDevice(device, _settings, "Non-OpenCL Kernel.EXECUTION_MODE requested but device is not a JavaDevice ");
             }
             executeJava(_settings, (JavaDevice) device);
          }
@@ -1536,7 +1885,7 @@ public class KernelRunner extends KernelRunnerJNI{
          return kernel;
       }
       finally {
-         _settings.profile.onEvent(ProfilingEvent.EXECUTED);
+         _settings.profile.onEvent(device, ProfilingEvent.EXECUTED);
          maybeReportProfile(_settings);
       }
    }
@@ -1579,7 +1928,7 @@ public class KernelRunner extends KernelRunnerJNI{
                return false;
          }
       } else {
-         return (device == kernel.getTargetDevice());
+         return KernelManager.instance().getPreferences(kernel).isDeviceAmongPreferredDevices(device);
       }
    }
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2016 - 2017 Syncleus, Inc.
+ * Copyright (c) 2016 - 2018 Syncleus, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 package com.aparapi.device;
 
-public class JavaDevice extends Device {
+public class JavaDevice extends Device implements Comparable<Device> {
 
    public static final JavaDevice THREAD_POOL = new JavaDevice(TYPE.JTP, "Java Thread Pool", -3);
    public static final JavaDevice ALTERNATIVE_ALGORITHM = new JavaDevice(TYPE.ALT, "Java Alternative Algorithm", -2);
